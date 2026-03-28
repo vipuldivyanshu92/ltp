@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/teleop-transport", "crates/teleop-bridge"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/ltp"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

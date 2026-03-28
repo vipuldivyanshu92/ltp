@@ -1,0 +1,9 @@
+[package]
+name = "teleop-bridge"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "ROS 2 / host bridge hooks — uses teleop-transport C ABI only (no duplicate framing)"
+
+[dependencies]
+teleop-transport = { path = "../teleop-transport" }
