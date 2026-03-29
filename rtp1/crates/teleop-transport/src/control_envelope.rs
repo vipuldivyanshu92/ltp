@@ -7,6 +7,10 @@ pub const SCHEMA_TWIST: u16 = 1;
 pub const SCHEMA_JOINT_DELTA: u16 = 2;
 pub const SCHEMA_GAMEPAD: u16 = 3;
 pub const SCHEMA_EXPERIMENTAL_BASE: u16 = 0xE000;
+/// UTF-8 JSON `{"action": ..., "timestamp": ...}` (LeRobot teleop wire shape).
+pub const SCHEMA_LEROBOT_TELEOP_JSON: u16 = 0xE001;
+/// UTF-8 JSON `{"frames": {"cam_name": "<base64 jpeg>"}}` (LeRobot WS camera relay shape).
+pub const SCHEMA_LEROBOT_CAMERA_JSON: u16 = 0xE002;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ControlEnvelope {
@@ -70,6 +74,8 @@ pub fn schema_name(id: u16) -> &'static str {
         SCHEMA_TWIST => "twist",
         SCHEMA_JOINT_DELTA => "joint_delta",
         SCHEMA_GAMEPAD => "gamepad",
+        SCHEMA_LEROBOT_TELEOP_JSON => "lerobot_teleop_json",
+        SCHEMA_LEROBOT_CAMERA_JSON => "lerobot_camera_json",
         _ if id >= SCHEMA_EXPERIMENTAL_BASE => "experimental",
         _ => "unknown",
     }

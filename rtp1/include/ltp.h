@@ -12,7 +12,15 @@
 extern "C" {
 #endif
 
-#define LTP_H_ABI 1u
+#define LTP_H_ABI 2u
+
+/** `ltp_recv_pop` out_kind values */
+#define LTP_RECV_KIND_CONTROL 0
+#define LTP_RECV_KIND_VIDEO_JPEG 1
+
+/** Inner control schemas (LeRobot interop; UTF-8 JSON payloads) */
+#define LTP_SCHEMA_LEROBOT_TELEOP_JSON 0xE001u
+#define LTP_SCHEMA_LEROBOT_CAMERA_JSON 0xE002u
 
 uint32_t ltp_abi_version(void);
 uint32_t ltp_last_error(void);
@@ -37,6 +45,14 @@ int ltp_send_control(LtpSessionHandle *p, uint16_t stream_id, uint16_t schema_id
                      const uint8_t *data, size_t len, uint32_t seq, uint64_t timestamp_ns);
 
 int ltp_poll_recv(LtpSessionHandle *p, uint64_t now_ns);
+
+/**
+ * Pop one item queued by ltp_poll_recv. For LTP_RECV_KIND_CONTROL, out_schema_id is the
+ * application schema and buf receives the inner payload bytes (after ControlEnvelope).
+ * Returns 1 on success, 0 if empty, -1 on invalid args, -2 if cap < payload (*out_len = needed).
+ */
+int ltp_recv_pop(LtpSessionHandle *p, int *out_kind, uint16_t *out_schema_id,
+                 uint8_t *buf, size_t cap, size_t *out_len);
 
 /** Demo: sends SCHEMA_TWIST payload (6 floats, little-endian). */
 int ltp_send_twist_stub(LtpSessionHandle *p, uint16_t stream_id, uint32_t seq);
