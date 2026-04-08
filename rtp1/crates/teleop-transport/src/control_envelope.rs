@@ -11,6 +11,8 @@ pub const SCHEMA_EXPERIMENTAL_BASE: u16 = 0xE000;
 pub const SCHEMA_LEROBOT_TELEOP_JSON: u16 = 0xE001;
 /// UTF-8 JSON `{"frames": {"cam_name": "<base64 jpeg>"}}` (LeRobot WS camera relay shape).
 pub const SCHEMA_LEROBOT_CAMERA_JSON: u16 = 0xE002;
+/// Packed `TelemetryPacket` from Quest native (`teleop_client.h`): 112 bytes little-endian.
+pub const SCHEMA_QUEST_TELEOP112: u16 = 0xE010;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ControlEnvelope {
@@ -76,6 +78,7 @@ pub fn schema_name(id: u16) -> &'static str {
         SCHEMA_GAMEPAD => "gamepad",
         SCHEMA_LEROBOT_TELEOP_JSON => "lerobot_teleop_json",
         SCHEMA_LEROBOT_CAMERA_JSON => "lerobot_camera_json",
+        SCHEMA_QUEST_TELEOP112 => "quest_teleop112",
         _ if id >= SCHEMA_EXPERIMENTAL_BASE => "experimental",
         _ => "unknown",
     }

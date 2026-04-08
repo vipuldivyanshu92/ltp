@@ -16,6 +16,7 @@ pub mod video_slice;
 
 mod ffi;
 
+pub use control_envelope::SCHEMA_QUEST_TELEOP112;
 pub use header::{LtpHeader, PayloadType, PriorityClass, LTP_MAGIC, LTP_VERSION};
 pub use session::{Session, SessionConfig};
 

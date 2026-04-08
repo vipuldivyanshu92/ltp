@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/teleop-transport", "crates/teleop-bridge"]
+members = [
+    "crates/teleop-transport",
+    "crates/teleop-bridge",
+    "crates/ltp-robot-gateway",
+]
 
 [workspace.package]
 edition = "2021"
