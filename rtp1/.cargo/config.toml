@@ -1,0 +1,7 @@
+# Cross-link `x86_64-unknown-linux-gnu` from macOS: the default `cc` invokes Apple `ld`,
+# which does not understand GNU ld flags (e.g. `--version-script`) that Rust passes for
+# `cdylib`. Delegate linking to Zig's `cc` driver (Linux glibc) via the wrapper below.
+#
+# Prerequisite: install Zig and ensure `zig` is on PATH (e.g. `brew install zig`).
+[target.x86_64-unknown-linux-gnu]
+linker = "scripts/zig-cc-x86_64-linux-gnu.sh"

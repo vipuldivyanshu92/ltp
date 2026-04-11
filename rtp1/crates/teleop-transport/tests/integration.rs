@@ -111,14 +111,14 @@ fn control_ordered_after_reorder() {
 
     let e0 = d.handle_datagram(h0, vec![10], 0, false);
     let e1 = d.handle_datagram(h1, vec![11], 0, false);
-    let mut flat = Vec::new();
+    let mut flat: Vec<Vec<u8>> = Vec::new();
     if let teleop_transport::receive::ReceivedEvent::ControlOrdered(v) = e0 {
         flat.extend(v);
     }
     if let teleop_transport::receive::ReceivedEvent::ControlOrdered(v) = e1 {
         flat.extend(v);
     }
-    assert_eq!(flat, vec![10, 11]);
+    assert_eq!(flat, vec![vec![10], vec![11]]);
 }
 
 #[test]

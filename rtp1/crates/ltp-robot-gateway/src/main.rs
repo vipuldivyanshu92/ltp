@@ -1,12 +1,13 @@
 //! Robot-site gateway: anvil_streamer (WS :9191) → LTP/UDP → cloud relay → Quest;
-//! Quest control (LTP) → relay → this process → TCP :8081 (quest_teleop).
+//! Quest control (LTP) → relay → this process → TCP **127.0.0.1:8081** (`--teleop-tcp`, `quest_teleop` listener).
+//! Video/LTP egress does **not** wait for teleop TCP so the UDP relay can learn the leader while Quest is still booting.
 //!
-//! Cloud relay: `python3 python/ltp_udp_relay.py --bind 0.0.0.0 --from-leader 6001 --from-follower 5001`
-//! - This binary is the **leader**: `--ltp-peer <VPS>:6001` (send video here).
-//! - Quest is the **follower**: sends control to `<VPS>:5001`.
+//! Cloud relay (fixed ports): `python3 python/ltp_udp_relay.py --bind 0.0.0.0 --from-leader 6001 --from-follower 5001`
+//! - **Port 6001** — robot / this binary (LTP **leader**): send video to the relay; control from Quest is forwarded back here. Use `--ltp-peer <VPS_PUBLIC_IP>:6001`.
+//! - **Port 5001** — Quest (LTP **follower**): receives video from the relay; sends controls to the relay. Configure the Quest LTP client with `<VPS_PUBLIC_IP>:5001` as its UDP peer (not the robot’s public IP).
 
 use std::io::Write;
-use std::net::{SocketAddr, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
@@ -42,16 +43,20 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:0")]
     ltp_bind: String,
 
-    /// Cloud relay **leader** port (robot → relay). Matches `--from-leader` on `ltp_udp_relay.py`.
+    /// Cloud relay port **6001** (LTP leader leg: robot → relay). Must match `--from-leader 6001` on `ltp_udp_relay.py`.
     #[arg(long)]
     ltp_peer: SocketAddr,
 
-    /// quest_teleop TCP address (112-byte `TelemetryPacket` frames)
+    /// quest_teleop TCP **connect** target (must be a real host, not `0.0.0.0` / `::`).
+    /// Default: local listener on 8081.
     #[arg(long, default_value = "127.0.0.1:8081")]
     teleop_tcp: SocketAddr,
 
-    /// LTP datagram MTU budget (payload slicing)
-    #[arg(long, default_value_t = 1200)]
+    /// LTP datagram MTU budget (payload slicing). Larger values reduce datagram count per JPEG
+    /// (easier on WAN) until path MTU causes IP fragmentation or loss; LTP v1 allows at most
+    /// 255 slices per frame. If `pending_send` in logs stays high, lower camera JPEG quality or
+    /// raise this cautiously (rough max JPEG ≈ `(mtu - 40) * 255`).
+    #[arg(long, default_value_t = 1380)]
     ltp_mtu: usize,
 
     /// Camera ROS compressed topics (must be 4, same order as Quest panels)
@@ -178,6 +183,7 @@ fn ws_camera_thread(
     }
 }
 
+/// Returns number of LTP datagrams (slices) queued on success.
 fn send_jpeg_ltp(
     session: &mut Session,
     stream_id: u16,
@@ -185,18 +191,21 @@ fn send_jpeg_ltp(
     frame_id: u16,
     jpeg: &[u8],
     capture_ns: u64,
-) -> Result<()> {
+) -> Result<usize> {
     let chunks = video_slice::slice_payload(session.cfg.mtu, VIDEO_HDR_BODY, jpeg);
     let n = chunks.len();
     if n > 255 {
+        let hdr = VIDEO_HDR_BODY;
+        let min_mtu = (jpeg.len() + 254) / 255 + hdr;
         bail!(
-            "JPEG {} bytes needs {} slices; max 255 for LTP v1 slice_count (reduce resolution or raise MTU)",
+            "JPEG {} bytes needs {} slices; max 255 for LTP v1 slice_count (reduce resolution or raise --ltp-mtu to at least ~{})",
             jpeg.len(),
-            n
+            n,
+            min_mtu
         );
     }
     if n == 0 {
-        return Ok(());
+        return Ok(0);
     }
     let slice_count = n as u8;
     let deadline_ns = capture_ns.saturating_add(100_000_000);
@@ -223,7 +232,7 @@ fn send_jpeg_ltp(
         });
     }
     session.flush_send()?;
-    Ok(())
+    Ok(n)
 }
 
 fn open_teleop_stream(addr: SocketAddr) -> Result<TcpStream> {
@@ -233,46 +242,144 @@ fn open_teleop_stream(addr: SocketAddr) -> Result<TcpStream> {
     Ok(s)
 }
 
+fn validate_teleop_tcp(addr: SocketAddr) -> Result<()> {
+    match addr.ip() {
+        IpAddr::V4(v4) if v4.is_unspecified() => {
+            bail!(
+                "--teleop-tcp must not use 0.0.0.0 (bind wildcard, not a connect target); use 127.0.0.1:8081 for local quest_teleop"
+            );
+        }
+        IpAddr::V6(v6) if v6.is_unspecified() => {
+            bail!("--teleop-tcp must not use :: (unspecified); use [::1]:8081 for local quest_teleop");
+        }
+        _ => Ok(()),
+    }
+}
+
+#[derive(Default)]
+struct GatewayStats {
+    jpeg_frames: [u64; 4],
+    jpeg_bytes: [u64; 4],
+    /// Cumulative slice count framed for LTP (not the same as kernel TX completion).
+    ltp_slices_encoded: u64,
+    control_to_teleop: u64,
+    control_dropped_no_tcp: u64,
+    ingress_dup: u64,
+    ingress_video: u64,
+    ingress_telem: u64,
+    last_emit: Option<Instant>,
+    last_pending_send: usize,
+    max_pending_send: usize,
+}
+
+impl GatewayStats {
+    fn maybe_log(&mut self, now: Instant) {
+        const INTERVAL: Duration = Duration::from_secs(5);
+        let frames_sum: u64 = self.jpeg_frames.iter().sum();
+        if frames_sum == 0
+            && self.ltp_slices_encoded == 0
+            && self.ingress_dup + self.ingress_video + self.ingress_telem == 0
+        {
+            return;
+        }
+        let should_emit = match self.last_emit {
+            None => true,
+            Some(t) => now.duration_since(t) >= INTERVAL,
+        };
+        if !should_emit {
+            return;
+        }
+        self.last_emit = Some(now);
+        info!(
+            "gateway stats: JPEG frames per cam {:?} bytes per cam roughly {:?} | LTP slices encoded (cumulative) {} pending_send(now/max) {}/{} | control→TCP {} dropped(no TCP) {} | ingress dup {} video_evt {} telem {}",
+            self.jpeg_frames,
+            self.jpeg_bytes,
+            self.ltp_slices_encoded,
+            self.last_pending_send,
+            self.max_pending_send,
+            self.control_to_teleop,
+            self.control_dropped_no_tcp,
+            self.ingress_dup,
+            self.ingress_video,
+            self.ingress_telem,
+        );
+    }
+}
+
 fn ltp_main_loop(
     mut session: Session,
     jpeg_rx: Receiver<(u8, Vec<u8>)>,
     teleop_addr: SocketAddr,
 ) -> Result<()> {
-    let mut teleop = open_teleop_stream(teleop_addr)?;
+    // Teleop TCP is optional for startup: LTP video must flow even when quest_teleop is not up,
+    // otherwise the UDP relay never sees the leader and Quest never gets a forwarding path.
+    let mut teleop: Option<TcpStream> = None;
+    let mut teleop_backoff = Duration::from_millis(200);
+    let mut next_teleop_try = Instant::now();
+    let mut next_teleop_warn = Instant::now();
+
+    let mut stats = GatewayStats::default();
     // Global LTP `frame_id` for all cameras (`ReceiveDemux` video map is keyed only by `frame_id`).
     let mut global_frame_id: u16 = 0;
     let mut seq: u32 = 0;
 
     loop {
         let t0 = Instant::now();
+        let wall = Instant::now();
+
+        if teleop.is_none() && wall >= next_teleop_try {
+            match open_teleop_stream(teleop_addr) {
+                Ok(s) => {
+                    info!("teleop TCP connected to {teleop_addr}");
+                    teleop = Some(s);
+                    teleop_backoff = Duration::from_millis(200);
+                }
+                Err(e) => {
+                    if wall >= next_teleop_warn {
+                        warn!(
+                            "teleop TCP {teleop_addr}: {e:#} — LTP/UDP video still runs without it; start quest_teleop when ready (this message every 15s)"
+                        );
+                        next_teleop_warn = wall + Duration::from_secs(15);
+                    }
+                    next_teleop_try = wall + teleop_backoff;
+                    teleop_backoff = (teleop_backoff * 2).min(Duration::from_secs(2));
+                }
+            }
+        }
+
         session.poll_ingress()?;
+        // Drain scheduler after a prior WouldBlock, or when video threads produced frames
+        // faster than the last flush completed.
+        session.flush_send()?;
         let now = now_ns();
         let events = session.drain_ingress(true, now);
         for ev in events {
-            if let ReceivedEvent::ControlOrdered(chunks) = ev {
-                for chunk in chunks {
-                    if let Ok(env) = ControlEnvelope::decode(&chunk) {
-                        if env.schema_id == SCHEMA_QUEST_TELEOP112
-                            && env.payload.len() == QUEST_TELEOP112_LEN
-                        {
-                            if let Err(e) = teleop.write_all(&env.payload) {
-                                warn!("teleop TCP write: {e}; reconnect");
-                                loop {
-                                    match open_teleop_stream(teleop_addr) {
-                                        Ok(s) => {
-                                            teleop = s;
-                                            break;
-                                        }
-                                        Err(e2) => {
-                                            error!("teleop reconnect failed: {e2}");
-                                            std::thread::sleep(Duration::from_millis(200));
-                                        }
+            match ev {
+                ReceivedEvent::ControlOrdered(chunks) => {
+                    for chunk in chunks {
+                        if let Ok(env) = ControlEnvelope::decode(&chunk) {
+                            if env.schema_id == SCHEMA_QUEST_TELEOP112
+                                && env.payload.len() == QUEST_TELEOP112_LEN
+                            {
+                                if let Some(ref mut t) = teleop {
+                                    if let Err(e) = t.write_all(&env.payload) {
+                                        warn!("teleop TCP write: {e}; will reconnect");
+                                        teleop = None;
+                                        teleop_backoff = Duration::from_millis(200);
+                                        next_teleop_try = Instant::now();
+                                        break;
                                     }
+                                    stats.control_to_teleop += 1;
+                                } else {
+                                    stats.control_dropped_no_tcp += 1;
                                 }
                             }
                         }
                     }
                 }
+                ReceivedEvent::Duplicate => stats.ingress_dup += 1,
+                ReceivedEvent::VideoProgress { .. } => stats.ingress_video += 1,
+                ReceivedEvent::Telemetry(_) => stats.ingress_telem += 1,
             }
         }
 
@@ -285,8 +392,13 @@ fn ltp_main_loop(
             let sid = (cam as u16) + 1;
             let fid = global_frame_id;
             let cap = now_ns();
-            if let Err(e) = send_jpeg_ltp(&mut session, sid, &mut seq, fid, &jpeg, cap) {
-                warn!("send_jpeg_ltp cam{cam}: {e}");
+            match send_jpeg_ltp(&mut session, sid, &mut seq, fid, &jpeg, cap) {
+                Ok(n) => {
+                    stats.jpeg_frames[cam] += 1;
+                    stats.jpeg_bytes[cam] += jpeg.len() as u64;
+                    stats.ltp_slices_encoded += n as u64;
+                }
+                Err(e) => warn!("send_jpeg_ltp cam{cam}: {e}"),
             }
         }
 
@@ -298,8 +410,13 @@ fn ltp_main_loop(
                     let sid = (cam as u16) + 1;
                     let fid = global_frame_id;
                     let cap = now_ns();
-                    if let Err(e) = send_jpeg_ltp(&mut session, sid, &mut seq, fid, &jpeg, cap) {
-                        warn!("send_jpeg_ltp cam{cam}: {e}");
+                    match send_jpeg_ltp(&mut session, sid, &mut seq, fid, &jpeg, cap) {
+                        Ok(n) => {
+                            stats.jpeg_frames[cam] += 1;
+                            stats.jpeg_bytes[cam] += jpeg.len() as u64;
+                            stats.ltp_slices_encoded += n as u64;
+                        }
+                        Err(e) => warn!("send_jpeg_ltp cam{cam}: {e}"),
                     }
                 }
             }
@@ -307,9 +424,20 @@ fn ltp_main_loop(
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
 
-        // Avoid hot spin when idle
+        let pending = session.pending_send_datagrams();
+        stats.last_pending_send = pending;
+        stats.max_pending_send = stats.max_pending_send.max(pending);
+        stats.maybe_log(wall);
+
+        // When the LTP scheduler still has datagrams (often after UDP WouldBlock), avoid sleeping
+        // a full 2ms so we return to flush_send sooner and drain the kernel TX queue faster.
         let elapsed = t0.elapsed();
-        if elapsed < Duration::from_millis(2) {
+        if pending > 0 {
+            let min_period = Duration::from_micros(400);
+            if elapsed < min_period {
+                std::thread::sleep(min_period - elapsed);
+            }
+        } else if elapsed < Duration::from_millis(2) {
             std::thread::sleep(Duration::from_millis(2) - elapsed);
         }
     }
@@ -324,6 +452,7 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    validate_teleop_tcp(args.teleop_tcp).context("invalid --teleop-tcp")?;
     let bind: SocketAddr = args
         .ltp_bind
         .parse()

@@ -26,7 +26,7 @@ impl Default for SessionConfig {
             dedup_cap: 4096,
             max_reorder: 32,
             bonding: BondingPolicy::default(),
-            mtu: 1200,
+            mtu: 1380,
         }
     }
 }
@@ -67,10 +67,30 @@ impl Session {
         self.scheduler.enqueue(p);
     }
 
+    /// Count of framed datagrams still to send (after `WouldBlock`, this grows until flushed).
+    pub fn pending_send_datagrams(&self) -> usize {
+        self.scheduler.pending_len()
+    }
+
     pub fn flush_send(&mut self) -> io::Result<()> {
         self.scheduler.reset_telemetry_tick();
         while let Some(pkt) = self.scheduler.pop_next() {
-            self.send_datagram_on_paths(&pkt)?;
+            match self.send_datagram_on_paths(&pkt) {
+                Ok(()) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    // Non-blocking UDP: kernel TX queue full. Keep ordering by putting this
+                    // datagram back and trying again on the next `flush_send` (caller should
+                    // call flush even when not enqueueing new video).
+                    self.scheduler.enqueue(pkt);
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
         }
         Ok(())
     }

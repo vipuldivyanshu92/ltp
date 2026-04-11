@@ -9,5 +9,6 @@ description = "Low-latency teleoperation UDP transport (LTP1)"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+socket2 = "0.5"
 
 [dev-dependencies]

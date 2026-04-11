@@ -16,7 +16,8 @@ mod tests {
     fn chunks_respect_mtu() {
         let mtu = 50;
         let hdr = 32;
-        let p = vec![7u8; 100];
+        // mtu 50 − hdr 32 ⇒ 18-byte chunks; 54 bytes ⇒ exactly 3 chunks.
+        let p = vec![7u8; 54];
         let s = slice_payload(mtu, hdr, &p);
         assert_eq!(s.len(), 3);
         assert!(s.iter().all(|c| c.len() <= mtu - hdr));

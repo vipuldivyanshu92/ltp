@@ -89,6 +89,14 @@ impl PriorityScheduler {
     pub fn reset_telemetry_tick(&mut self) {
         self.telemetry_sent_this_tick = 0;
     }
+
+    /// Datagrams waiting in the send scheduler (not yet accepted by the kernel).
+    pub fn pending_len(&self) -> usize {
+        self.control.len()
+            + self.haptic.len()
+            + self.video.len()
+            + self.telemetry.len()
+    }
 }
 
 #[cfg(test)]
@@ -140,5 +148,17 @@ mod tests {
         ));
         let a = s.pop_next().unwrap();
         assert_eq!(a.deadline_key, 10);
+    }
+
+    #[test]
+    fn pending_len_tracks_queues() {
+        let mut s = PriorityScheduler::default();
+        assert_eq!(s.pending_len(), 0);
+        s.enqueue(pkt(PriorityClass::Video, PayloadType::VideoSlice, 1, 10));
+        assert_eq!(s.pending_len(), 1);
+        s.enqueue(pkt(PriorityClass::Control, PayloadType::Control, 0, 5));
+        assert_eq!(s.pending_len(), 2);
+        let _ = s.pop_next();
+        assert_eq!(s.pending_len(), 1);
     }
 }

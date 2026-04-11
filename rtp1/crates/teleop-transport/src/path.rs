@@ -26,6 +26,13 @@ impl PathHandle {
     pub fn open(config: PathConfig) -> io::Result<Self> {
         let socket = UdpSocket::bind(config.bind_addr)?;
         socket.set_nonblocking(true)?;
+        // Bursty multi-camera video: a small default SNDBUF causes frequent WouldBlock when
+        // many ~MTU datagrams enqueue faster than the kernel drains to the NIC.
+        #[cfg(unix)]
+        {
+            let sock_ref = socket2::SockRef::from(&socket);
+            let _ = sock_ref.set_send_buffer_size(8 * 1024 * 1024);
+        }
         Ok(Self {
             config,
             socket,
