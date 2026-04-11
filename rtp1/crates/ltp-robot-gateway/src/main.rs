@@ -208,7 +208,9 @@ fn send_jpeg_ltp(
         return Ok(0);
     }
     let slice_count = n as u8;
-    let deadline_ns = capture_ns.saturating_add(100_000_000);
+    // Header (deadline_ns - timestamp_ns) is the reassembly budget on the *receiver* timeline
+    // (see `VideoReassembly::ingest`). Keep generous for WAN + multi-slice interleaving.
+    let deadline_ns = capture_ns.saturating_add(500_000_000);
 
     for (i, chunk) in chunks.iter().enumerate() {
         *seq = seq.wrapping_add(1);

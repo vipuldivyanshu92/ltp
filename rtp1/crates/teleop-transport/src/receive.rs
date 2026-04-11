@@ -81,7 +81,10 @@ impl StreamReorder {
 struct FrameBuf {
     slices: HashMap<u8, Vec<u8>>,
     expected: u8,
-    deadline_ns: u64,
+    /// Receiver-local monotonic cutoff (`now_ns` domain) after which the partial frame is dropped.
+    /// Set from the first slice using header `(deadline_ns - timestamp_ns)` so host clock skew
+    /// between sender and receiver does not instantly expire WAN video.
+    drop_after_ns: u64,
 }
 
 pub struct VideoReassembly {
@@ -95,6 +98,21 @@ impl Default for VideoReassembly {
             frames: HashMap::new(),
             last_complete: None,
         }
+    }
+}
+
+/// Min / max reassembly window from first arriving slice (`now_ns` on this host).
+const VIDEO_REASSEMBLY_BUDGET_MIN_NS: u64 = 50_000_000;
+const VIDEO_REASSEMBLY_BUDGET_MAX_NS: u64 = 2_000_000_000;
+const VIDEO_REASSEMBLY_BUDGET_DEFAULT_NS: u64 = 500_000_000;
+
+fn video_reassembly_budget_ns(h: &LtpHeader) -> u64 {
+    let d = h.deadline_ns();
+    let t = h.timestamp_ns;
+    if d > t {
+        (d - t).clamp(VIDEO_REASSEMBLY_BUDGET_MIN_NS, VIDEO_REASSEMBLY_BUDGET_MAX_NS)
+    } else {
+        VIDEO_REASSEMBLY_BUDGET_DEFAULT_NS
     }
 }
 
@@ -113,12 +131,14 @@ impl VideoReassembly {
         if entry.expected == 0 && h.slice_count > 0 {
             entry.expected = h.slice_count;
         }
-        if h.deadline_ns() > 0 {
-            entry.deadline_ns = h.deadline_ns();
-        }
-        if now_ns > entry.deadline_ns && entry.deadline_ns > 0 {
-            self.frames.remove(&frame_id);
-            return None;
+        let budget = video_reassembly_budget_ns(h);
+        // Sliding completion window: extend on every slice. A fixed deadline from only the
+        // first-arriving slice breaks when UDP delivers slice 1..N-1 before slice 0 and slice 0
+        // lands after that original window (WAN reordering); the frame would never complete.
+        if entry.drop_after_ns == 0 {
+            entry.drop_after_ns = now_ns.saturating_add(budget);
+        } else {
+            entry.drop_after_ns = entry.drop_after_ns.max(now_ns.saturating_add(budget));
         }
         entry.slices.insert(h.slice_id, payload.to_vec());
         let done = entry.expected > 0 && entry.slices.len() >= entry.expected as usize;
@@ -137,16 +157,88 @@ impl VideoReassembly {
         }
     }
 
+    /// Drop partial frames whose sliding deadline has passed (no slice arrived in time).
+    ///
+    /// Do **not** call this on every LTP datagram: control/haptic traffic between video slices
+    /// advances `now_ns` between polls and would delete in-flight multi-slice assemblies before
+    /// later slices arrive. Call from a low-rate housekeeping path if needed.
     pub fn sweep_stale(&mut self, now_ns: u64) {
         let stale: Vec<u16> = self
             .frames
             .iter()
-            .filter(|(_, f)| f.deadline_ns > 0 && now_ns > f.deadline_ns)
+            .filter(|(_, f)| f.drop_after_ns > 0 && now_ns > f.drop_after_ns)
             .map(|(&k, _)| k)
             .collect();
         for k in stale {
             self.frames.remove(&k);
         }
+    }
+}
+
+#[cfg(test)]
+mod video_reassembly_tests {
+    use super::VideoReassembly;
+    use crate::header::{LtpHeader, PayloadType, PriorityClass};
+
+    fn slice_hdr(
+        frame_id: u16,
+        slice_id: u8,
+        slice_count: u8,
+        capture_ns: u64,
+        deadline_ns: u64,
+    ) -> LtpHeader {
+        let mut h = LtpHeader::default();
+        h.payload_type = PayloadType::VideoSlice;
+        h.priority = PriorityClass::Video;
+        h.frame_id = frame_id;
+        h.slice_id = slice_id;
+        h.slice_count = slice_count;
+        h.timestamp_ns = capture_ns;
+        h.set_deadline_extension(deadline_ns);
+        h
+    }
+
+    #[test]
+    fn video_completes_when_receiver_clock_far_ahead_of_sender_wall_deadline() {
+        let mut v = VideoReassembly::default();
+        let robot_capture = 1_000_000_000_000u64;
+        let h = slice_hdr(7, 0, 1, robot_capture, robot_capture + 100_000_000);
+        let quest_now = robot_capture + 10_000_000_000;
+        let jpeg = vec![0xff, 0xd8, 0xff, 0xd9];
+        let out = v.ingest(&h, &jpeg, quest_now);
+        assert!(
+            out.is_some(),
+            "single-slice JPEG must reassemble; old logic compared absolute sender deadline to receiver now and dropped everything"
+        );
+    }
+
+    #[test]
+    fn multi_slice_uses_header_budget_on_receiver_timeline() {
+        let mut v = VideoReassembly::default();
+        let t0 = 5_000_000_000u64;
+        let mut h0 = slice_hdr(1, 0, 2, t0, t0 + 200_000_000);
+        h0.seq = 1;
+        assert!(v.ingest(&h0, b"a", t0).is_none());
+        let mut h1 = slice_hdr(1, 1, 2, t0, t0 + 200_000_000);
+        h1.seq = 2;
+        let out = v.ingest(&h1, b"b", t0 + 50_000_000).unwrap();
+        assert_eq!(out, b"ab");
+    }
+
+    #[test]
+    fn multi_slice_slice_zero_arrives_last_after_reorder_still_completes() {
+        let mut v = VideoReassembly::default();
+        let t0 = 1_000_000_000u64;
+        let mut h1 = slice_hdr(9, 1, 2, t0, t0 + 200_000_000);
+        h1.seq = 2;
+        assert!(v.ingest(&h1, b"b", t0).is_none());
+        // Slice 0 arrives after the header's 200ms budget from t0 alone; fixed-from-first-slice
+        // logic would expire before slice 0 and never assemble.
+        let late = t0 + 250_000_000;
+        let mut h0 = slice_hdr(9, 0, 2, t0, t0 + 200_000_000);
+        h0.seq = 1;
+        let out = v.ingest(&h0, b"a", late).unwrap();
+        assert_eq!(out, b"ab");
     }
 }
 

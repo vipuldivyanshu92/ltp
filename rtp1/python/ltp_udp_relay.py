@@ -24,6 +24,13 @@ On first datagram from each side, the relay learns that side's public (ip, port)
 After both are known, each incoming datagram on one port is sent to the other side's
 last seen address.
 
+**Source port / NAT:** Video must leave the VPS on **5001** (the follower leg), because the
+Quest opened its home NAT mapping toward ``VPS:5001``. Forwarding video from the same socket
+that listens on **6001** would use source port **6001** and is often dropped by symmetric or
+restricted cone NATs. This relay therefore sends leader→follower traffic **out the follower
+socket**, and follower→leader **out the leader socket**, so each client sees replies from the
+same UDP port it already talks to.
+
 Deploy on a small West Coast VPS (Ubuntu):
 
   sudo apt update && sudo apt install -y python3
@@ -89,6 +96,8 @@ class RelayState:
         self._started = time.monotonic()
         # Rate-limit reminder when leader is active but Quest never hits the follower port.
         self._next_follower_missing_reminder = 0.0
+        self.leader_transport: asyncio.DatagramTransport | None = None
+        self.follower_transport: asyncio.DatagramTransport | None = None
 
     def log_periodic(self) -> None:
         age = int(time.monotonic() - self._started)
@@ -134,6 +143,11 @@ class RelayProtocol(asyncio.DatagramProtocol):
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.transport = transport  # type: ignore[assignment]
+        dt = transport  # type: ignore[assignment]
+        if self.side == "leader":
+            self.state.leader_transport = dt
+        else:
+            self.state.follower_transport = dt
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
         st = self.state
@@ -145,6 +159,8 @@ class RelayProtocol(asyncio.DatagramProtocol):
             st.bytes_in_leader += len(data)
             dst = st.follower_addr
             label = "leader→follower"
+            # Reply from same port Quest uses (5001) so home NAT accepts video return path.
+            out_transport = st.follower_transport
         else:
             if st.follower_addr != addr:
                 logger.info(
@@ -157,6 +173,8 @@ class RelayProtocol(asyncio.DatagramProtocol):
             st.bytes_in_follower += len(data)
             dst = st.leader_addr
             label = "follower→leader"
+            # Reply from same port robot uses (6001) so NAT accepts control return path.
+            out_transport = st.leader_transport
 
         if dst is None:
             if self.side == "leader" and not st._warned_leader_stall:
@@ -175,9 +193,9 @@ class RelayProtocol(asyncio.DatagramProtocol):
                     "robot until the leader sends to the relay leader port.",
                 )
             return
-        if self.transport is None:
+        if out_transport is None:
             return
-        self.transport.sendto(data, dst)
+        out_transport.sendto(data, dst)
         if self.side == "leader":
             st.pkts_fwd_to_follower += 1
             st.bytes_fwd_to_follower += len(data)

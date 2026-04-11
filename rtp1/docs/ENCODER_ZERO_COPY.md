@@ -3,7 +3,7 @@
 ## Buffer ownership
 
 1. **Hardware encoder output** (NVENC, V4L2 export, Jetson NVMM): the memory backing a slice **must remain valid** until `ltp_send_*` (or your flush) completes—same contract as `sendmsg`.
-2. Tag each slice with `frame_id`, `slice_id`, `slice_count`, and optional **deadline** via `LtpHeader::set_deadline_extension` (first 8 bytes of extension = deadline in nanoseconds).
+2. Tag each slice with `frame_id`, `slice_id`, `slice_count`, and optional **deadline** via `LtpHeader::set_deadline_extension` (first 8 bytes of extension = deadline in nanoseconds). Receivers derive a **local** drop time from `(deadline_ns - timestamp_ns)` so robot and headset wall clocks need not match.
 3. Prefer **one copy** from encoder bitstream into a **pinned** datagram buffer if `MSG_ZEROCOPY` is unavailable on your kernel/NIC.
 
 ## MSG_ZEROCOPY
