@@ -77,6 +77,8 @@ def load():
     lib.ltp_recv_pop.restype = c_int
     lib.ltp_send_twist_stub.argtypes = [ctypes.c_void_p, c_uint16, c_uint32]
     lib.ltp_send_twist_stub.restype = c_int
+    lib.ltp_recv_last_video_age_us.argtypes = [ctypes.c_void_p]
+    lib.ltp_recv_last_video_age_us.restype = c_uint64
     return lib
 
 
@@ -164,6 +166,14 @@ class LtpSession:
         rc = self._lib.ltp_poll_recv(self._ptr, now_ns)
         if rc != 0:
             raise RuntimeError(f"ltp_poll_recv failed rc={rc} last_error={self._lib.ltp_last_error()}")
+
+    def last_video_age_us(self) -> int:
+        """End-to-end age (µs) of the last video frame delivered by recv_pop_bytes.
+        Computed inside the Rust library as (wall_now - header.timestamp_ns) at pop time.
+        Use for display-side latency overlay. Returns 0 before any video is delivered."""
+        if not self._ptr:
+            return 0
+        return int(self._lib.ltp_recv_last_video_age_us(self._ptr))
 
     def recv_pop_bytes(self) -> tuple[int, int, bytes] | None:
         """Returns (kind, schema_id, payload) or None if empty. schema_id is meaningful for CONTROL kind."""

@@ -60,6 +60,13 @@ size_t ltp_recv_video_pending_bytes(const LtpSessionHandle *p);
 int ltp_recv_pop(LtpSessionHandle *p, int *out_kind, uint16_t *out_schema_id,
                  uint8_t *buf, size_t cap, size_t *out_len);
 
+/**
+ * End-to-end age (microseconds) of the last video frame delivered by ltp_recv_pop.
+ * Computed as (wall_now - header.timestamp_ns) at pop time.  0 if no video delivered yet.
+ * Use for display-side latency overlay.
+ */
+uint64_t ltp_recv_last_video_age_us(const LtpSessionHandle *p);
+
 /** Demo: sends SCHEMA_TWIST payload (6 floats, little-endian). */
 int ltp_send_twist_stub(LtpSessionHandle *p, uint16_t stream_id, uint32_t seq);
 

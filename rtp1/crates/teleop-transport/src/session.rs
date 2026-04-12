@@ -72,7 +72,19 @@ impl Session {
         self.scheduler.pending_len()
     }
 
-    pub fn flush_send(&mut self) -> io::Result<()> {
+    /// Number of video datagrams currently queued in the scheduler.
+    pub fn video_queue_len(&self) -> usize {
+        self.scheduler.video_queue_len()
+    }
+
+    /// Cumulative video datagrams dropped (deadline purge + cap overflow).
+    pub fn video_dropped(&self) -> u64 {
+        self.scheduler.video_dropped
+    }
+
+    /// Purge expired video and flush the send queue.
+    pub fn flush_send(&mut self, now_ns: u64) -> io::Result<()> {
+        self.scheduler.purge_expired_video(now_ns);
         self.scheduler.reset_telemetry_tick();
         while let Some(mut pkt) = self.scheduler.pop_next() {
             match self.send_datagram_on_paths(&mut pkt) {

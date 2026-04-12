@@ -130,20 +130,31 @@ class RelayState:
             )
         la = f"{self.leader_addr[0]}:{self.leader_addr[1]}" if self.leader_addr else "—"
         fa = f"{self.follower_addr[0]}:{self.follower_addr[1]}" if self.follower_addr else "—"
+
+        elapsed = now_m - self._last_rate_ts if hasattr(self, "_last_rate_ts") else 10.0
+        elapsed = max(elapsed, 0.001)
+        dpL = self.pkts_in_leader - getattr(self, "_prev_pkts_in_leader", 0)
+        dpF = self.pkts_in_follower - getattr(self, "_prev_pkts_in_follower", 0)
+        dbL = self.bytes_in_leader - getattr(self, "_prev_bytes_in_leader", 0)
+        dbF = self.bytes_in_follower - getattr(self, "_prev_bytes_in_follower", 0)
+        dfwF = self.pkts_fwd_to_follower - getattr(self, "_prev_fwd_follower", 0)
+        dfwL = self.pkts_fwd_to_leader - getattr(self, "_prev_fwd_leader", 0)
+        self._prev_pkts_in_leader = self.pkts_in_leader
+        self._prev_pkts_in_follower = self.pkts_in_follower
+        self._prev_bytes_in_leader = self.bytes_in_leader
+        self._prev_bytes_in_follower = self.bytes_in_follower
+        self._prev_fwd_follower = self.pkts_fwd_to_follower
+        self._prev_fwd_leader = self.pkts_fwd_to_leader
+        self._last_rate_ts = now_m
+
         logger.info(
-            "relay stats (uptime %ds) endpoints leader=%s follower=%s | "
-            "in L%d/%dB F%d/%dB | out→F %d/%dB →L %d/%dB",
-            age,
-            la,
-            fa,
-            self.pkts_in_leader,
-            self.bytes_in_leader,
-            self.pkts_in_follower,
-            self.bytes_in_follower,
-            self.pkts_fwd_to_follower,
-            self.bytes_fwd_to_follower,
-            self.pkts_fwd_to_leader,
-            self.bytes_fwd_to_leader,
+            "relay (up %ds) %s↔%s | rate: L→%.0fpkt/s %.2fMB/s  F→%.0fpkt/s %.2fMB/s | "
+            "fwd→F %.0fpkt/s →L %.0fpkt/s | total L%d F%d",
+            age, la, fa,
+            dpL / elapsed, dbL / elapsed / 1e6,
+            dpF / elapsed, dbF / elapsed / 1e6,
+            dfwF / elapsed, dfwL / elapsed,
+            self.pkts_in_leader, self.pkts_in_follower,
         )
 
 

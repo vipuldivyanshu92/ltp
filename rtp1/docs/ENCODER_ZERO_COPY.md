@@ -14,3 +14,16 @@
 ## Footprint
 
 - See `docs/FOOTPRINT.md` after `cargo build --release`. The OpenSpec target is **&lt;30 MB** for core + thin bridge excluding vendor GPU SDKs.
+
+┌───────────────────────────────────────────────────────────────────────────┐
+│  INSTRUMENTATION POINTS                                                   │
+│                                                                           │
+│  [A] WS thread: JPEG complete → channel send (stamp wall time)           │
+│  [B] Main loop: channel recv → measure queue delay from [A]              │
+│  [C] Main loop: JPEG slice+enqueue+flush timing                         │
+│  [D] Main loop: per-phase breakdown (poll/flush/drain/jpeg)             │
+│  [E] Relay: per-interval rates (pkt/s, MB/s) + forwarding latency       │
+│  [F] FFI receiver: video frame reassembly age (now - capture_ts)         │
+│  [G] FFI: ltp_recv_last_video_age_us() for display-side measurement     │
+│  [H] Python: expose video age + recv logging                            │
+└───────────────────────────────────────────────────────────────────────────┘

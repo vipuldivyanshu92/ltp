@@ -11,7 +11,7 @@ use teleop_transport::session::{build_control_datagram, Session, SessionConfig};
 #[test]
 fn duplicate_path_sends_two_dgrams_loopback() {
     let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
-    peer.set_nonblocking(true).unwrap();
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
     let peer_addr = peer.local_addr().unwrap();
 
     let p1 = PathConfig {
@@ -43,7 +43,7 @@ fn duplicate_path_sends_two_dgrams_loopback() {
         datagram: dg,
         deadline_key: 0,
     });
-    s.flush_send().unwrap();
+    s.flush_send(0).unwrap();
 
     let mut b1 = [0u8; 2048];
     let mut b2 = [0u8; 2048];

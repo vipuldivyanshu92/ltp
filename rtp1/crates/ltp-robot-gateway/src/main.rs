@@ -123,12 +123,20 @@ impl JpegAssembler {
     }
 }
 
+/// JPEG with the wall-clock timestamp of when it was fully assembled in the WS
+/// thread. The main loop uses this to measure channel queuing delay.
+struct TimestampedJpeg {
+    cam: u8,
+    jpeg: Vec<u8>,
+    assembled_ns: u64,
+}
+
 fn ws_camera_thread(
     ws_host: String,
     ws_port: u16,
     topic: String,
     cam_index: u8,
-    tx: Sender<(u8, Vec<u8>)>,
+    tx: Sender<TimestampedJpeg>,
 ) {
     let url = format!("ws://{ws_host}:{ws_port}/");
     let mut backoff = Duration::from_millis(300);
@@ -160,7 +168,12 @@ fn ws_camera_thread(
                     let mut completed = Vec::new();
                     asm.push_chunk(&data, &mut completed);
                     for jpeg in completed {
-                        if tx.send((cam_index, jpeg)).is_err() {
+                        let msg = TimestampedJpeg {
+                            cam: cam_index,
+                            jpeg,
+                            assembled_ns: now_ns(),
+                        };
+                        if tx.send(msg).is_err() {
                             return;
                         }
                     }
@@ -208,8 +221,6 @@ fn send_jpeg_ltp(
         return Ok(0);
     }
     let slice_count = n as u8;
-    // Header (deadline_ns - timestamp_ns) is the reassembly budget on the *receiver* timeline
-    // (see `VideoReassembly::ingest`). Keep generous for WAN + multi-slice interleaving.
     let deadline_ns = capture_ns.saturating_add(500_000_000);
 
     for (i, chunk) in chunks.iter().enumerate() {
@@ -233,7 +244,7 @@ fn send_jpeg_ltp(
             deadline_key: deadline_ns,
         });
     }
-    session.flush_send()?;
+    session.flush_send(capture_ns)?;
     Ok(n)
 }
 
@@ -258,24 +269,34 @@ fn validate_teleop_tcp(addr: SocketAddr) -> Result<()> {
     }
 }
 
+const BACKPRESSURE_THRESHOLD: usize = 512;
+
 #[derive(Default)]
 struct GatewayStats {
     jpeg_frames: [u64; 4],
     jpeg_bytes: [u64; 4],
-    /// Cumulative slice count framed for LTP (not the same as kernel TX completion).
     ltp_slices_encoded: u64,
     control_to_teleop: u64,
     control_dropped_no_tcp: u64,
     ingress_dup: u64,
     ingress_video: u64,
     ingress_telem: u64,
+    jpegs_skipped_backpressure: u64,
     last_emit: Option<Instant>,
     last_pending_send: usize,
     max_pending_send: usize,
+    // Latency accumulators (reset each stats interval)
+    lat_channel_us_sum: u64,
+    lat_encode_us_sum: u64,
+    lat_poll_us_sum: u64,
+    lat_flush_us_sum: u64,
+    lat_drain_us_sum: u64,
+    lat_sample_count: u64,
+    lat_loop_count: u64,
 }
 
 impl GatewayStats {
-    fn maybe_log(&mut self, now: Instant) {
+    fn maybe_log(&mut self, now: Instant, video_dropped: u64) {
         const INTERVAL: Duration = Duration::from_secs(5);
         let frames_sum: u64 = self.jpeg_frames.iter().sum();
         if frames_sum == 0
@@ -292,36 +313,51 @@ impl GatewayStats {
             return;
         }
         self.last_emit = Some(now);
+        let n = self.lat_sample_count.max(1);
+        let loops = self.lat_loop_count.max(1);
         info!(
-            "gateway stats: JPEG frames per cam {:?} bytes per cam roughly {:?} | LTP slices encoded (cumulative) {} pending_send(now/max) {}/{} | control→TCP {} dropped(no TCP) {} | ingress dup {} video_evt {} telem {}",
+            "gateway: JPEG/cam {:?} | pending {}/{} dropped {} bp_skip {} | ctrl→TCP {} | dup {} vid {} tel {}",
             self.jpeg_frames,
-            self.jpeg_bytes,
-            self.ltp_slices_encoded,
             self.last_pending_send,
             self.max_pending_send,
+            video_dropped,
+            self.jpegs_skipped_backpressure,
             self.control_to_teleop,
-            self.control_dropped_no_tcp,
             self.ingress_dup,
             self.ingress_video,
             self.ingress_telem,
         );
+        info!(
+            "latency(avg µs): chan_queue={} encode={} | loop_phases: poll={} flush={} drain={} ({} loops, {} jpegs)",
+            self.lat_channel_us_sum / n,
+            self.lat_encode_us_sum / n,
+            self.lat_poll_us_sum / loops,
+            self.lat_flush_us_sum / loops,
+            self.lat_drain_us_sum / loops,
+            loops,
+            n,
+        );
+        self.lat_channel_us_sum = 0;
+        self.lat_encode_us_sum = 0;
+        self.lat_poll_us_sum = 0;
+        self.lat_flush_us_sum = 0;
+        self.lat_drain_us_sum = 0;
+        self.lat_sample_count = 0;
+        self.lat_loop_count = 0;
     }
 }
 
 fn ltp_main_loop(
     mut session: Session,
-    jpeg_rx: Receiver<(u8, Vec<u8>)>,
+    jpeg_rx: Receiver<TimestampedJpeg>,
     teleop_addr: SocketAddr,
 ) -> Result<()> {
-    // Teleop TCP is optional for startup: LTP video must flow even when quest_teleop is not up,
-    // otherwise the UDP relay never sees the leader and Quest never gets a forwarding path.
     let mut teleop: Option<TcpStream> = None;
     let mut teleop_backoff = Duration::from_millis(200);
     let mut next_teleop_try = Instant::now();
     let mut next_teleop_warn = Instant::now();
 
     let mut stats = GatewayStats::default();
-    // Global LTP `frame_id` for all cameras (`ReceiveDemux` video map is keyed only by `frame_id`).
     let mut global_frame_id: u16 = 0;
     let mut seq: u32 = 0;
 
@@ -348,11 +384,19 @@ fn ltp_main_loop(
             }
         }
 
-        // Always poll ingress + flush pending before anything else so control
-        // packets never wait behind a sleep or channel recv.
+        // Phase A: poll ingress
+        let tp_poll = Instant::now();
         session.poll_ingress()?;
-        session.flush_send()?;
+        stats.lat_poll_us_sum += tp_poll.elapsed().as_micros() as u64;
+
+        // Phase B: flush pending datagrams
+        let tp_flush = Instant::now();
         let now = now_ns();
+        session.flush_send(now)?;
+        stats.lat_flush_us_sum += tp_flush.elapsed().as_micros() as u64;
+
+        // Phase C: drain ingress events
+        let tp_drain = Instant::now();
         let events = session.drain_ingress(true, now);
         for ev in events {
             match ev {
@@ -383,22 +427,37 @@ fn ltp_main_loop(
                 ReceivedEvent::Telemetry(_) => stats.ingress_telem += 1,
             }
         }
+        stats.lat_drain_us_sum += tp_drain.elapsed().as_micros() as u64;
+        stats.lat_loop_count += 1;
 
+        // Phase D: encode + send JPEGs
+        let congested = session.video_queue_len() > BACKPRESSURE_THRESHOLD;
         let mut got_jpeg = false;
-        while let Ok((cam, jpeg)) = jpeg_rx.try_recv() {
+        while let Ok(msg) = jpeg_rx.try_recv() {
             got_jpeg = true;
-            let cam = cam as usize;
+            if congested {
+                stats.jpegs_skipped_backpressure += 1;
+                continue;
+            }
+            let cam = msg.cam as usize;
             if cam >= 4 {
                 continue;
             }
+            let dequeue_ns = now_ns();
+            let channel_delay_us = dequeue_ns.saturating_sub(msg.assembled_ns) / 1000;
+            stats.lat_channel_us_sum += channel_delay_us;
+
             global_frame_id = global_frame_id.wrapping_add(1);
             let sid = (cam as u16) + 1;
             let fid = global_frame_id;
-            let cap = now_ns();
-            match send_jpeg_ltp(&mut session, sid, &mut seq, fid, &jpeg, cap) {
+            let tp_enc = Instant::now();
+            match send_jpeg_ltp(&mut session, sid, &mut seq, fid, &msg.jpeg, dequeue_ns) {
                 Ok(n) => {
+                    let enc_us = tp_enc.elapsed().as_micros() as u64;
+                    stats.lat_encode_us_sum += enc_us;
+                    stats.lat_sample_count += 1;
                     stats.jpeg_frames[cam] += 1;
-                    stats.jpeg_bytes[cam] += jpeg.len() as u64;
+                    stats.jpeg_bytes[cam] += msg.jpeg.len() as u64;
                     stats.ltp_slices_encoded += n as u64;
                 }
                 Err(e) => warn!("send_jpeg_ltp cam{cam}: {e}"),
@@ -408,10 +467,8 @@ fn ltp_main_loop(
         let pending = session.pending_send_datagrams();
         stats.last_pending_send = pending;
         stats.max_pending_send = stats.max_pending_send.max(pending);
-        stats.maybe_log(t0);
+        stats.maybe_log(t0, session.video_dropped());
 
-        // Adaptive sleep: stay tight when datagrams are queued or JPEGs are
-        // flowing; idle longer only when nothing is happening to save CPU.
         let elapsed = t0.elapsed();
         let target = if pending > 0 {
             Duration::from_micros(50)
@@ -460,7 +517,7 @@ fn main() -> Result<()> {
         args.teleop_tcp
     );
 
-    let (tx, rx) = mpsc::channel::<(u8, Vec<u8>)>();
+    let (tx, rx) = mpsc::channel::<TimestampedJpeg>();
     for (i, topic) in args.topics.iter().enumerate() {
         let ws_host = args.ws_host.clone();
         let ws_port = args.ws_port;

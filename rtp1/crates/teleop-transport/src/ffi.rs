@@ -41,10 +41,10 @@ fn enqueue_events(h: &mut LtpSessionHandle, events: Vec<ReceivedEvent>) {
                     }
                 }
             }
-            ReceivedEvent::VideoProgress { frame } => {
+            ReceivedEvent::VideoProgress { frame, capture_ns } => {
                 if let Some(jpeg) = frame {
-                    // Latest JPEG only: never queue behind high-rate control (would starve display).
                     h.pending_video = Some(jpeg);
+                    h.pending_video_capture_ns = capture_ns;
                 }
             }
             ReceivedEvent::Telemetry(_) => {}
@@ -92,6 +92,12 @@ pub struct LtpSessionHandle {
     recv_queue: VecDeque<RecvItem>,
     /// Most recent complete video frame not yet consumed by `ltp_recv_pop`.
     pending_video: Option<Vec<u8>>,
+    /// Capture timestamp (header `timestamp_ns`) of the pending video frame.
+    pending_video_capture_ns: u64,
+    /// Age in microseconds of the last video frame delivered via `ltp_recv_pop`.
+    last_video_age_us: u64,
+    /// Capture timestamp of the last delivered video frame.
+    last_video_capture_ns: u64,
 }
 
 fn parse_addr(host: *const c_char, port: u16) -> Result<SocketAddr, LtpErr> {
@@ -143,6 +149,9 @@ pub extern "C" fn ltp_session_create(cfg: *const ltp_config) -> *mut LtpSessionH
         inner: session,
         recv_queue: VecDeque::new(),
         pending_video: None,
+        pending_video_capture_ns: 0,
+        last_video_age_us: 0,
+        last_video_capture_ns: 0,
     }))
 }
 
@@ -192,7 +201,7 @@ pub extern "C" fn ltp_send_control(
         datagram: dg,
         deadline_key: timestamp_ns,
     });
-    match sess.inner.flush_send() {
+    match sess.inner.flush_send(timestamp_ns) {
         Ok(()) => set_err(LtpErr::Ok),
         Err(_) => set_err(LtpErr::Io),
     }
@@ -261,6 +270,15 @@ pub extern "C" fn ltp_recv_pop(
     if let Some(vl) = video_len {
         if vl <= cap {
             let jpeg = h.pending_video.take().unwrap();
+            let cap_ns = h.pending_video_capture_ns;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            let age_us = now.saturating_sub(cap_ns) / 1000;
+            h.last_video_age_us = age_us;
+            h.last_video_capture_ns = cap_ns;
+
             let (kind, schema, src) = (1i32, 0u16, jpeg);
             unsafe {
                 if !buf.is_null() && !src.is_empty() {
@@ -300,6 +318,18 @@ pub extern "C" fn ltp_recv_pop(
         *out_len = video_len.unwrap_or(0);
     }
     -2
+}
+
+/// End-to-end age (microseconds) of the last video frame delivered by `ltp_recv_pop`.
+/// Computed as `wall_clock_now - header.timestamp_ns` at pop time. Useful for
+/// display-side latency overlay. Returns 0 if no video has been delivered yet.
+#[no_mangle]
+pub extern "C" fn ltp_recv_last_video_age_us(p: *const LtpSessionHandle) -> u64 {
+    if p.is_null() {
+        return 0;
+    }
+    let h = unsafe { &*p };
+    h.last_video_age_us
 }
 
 #[no_mangle]

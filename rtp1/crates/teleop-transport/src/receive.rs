@@ -300,8 +300,9 @@ impl ReceiveDemux {
                 ReceivedEvent::ControlOrdered(ordered)
             }
             (_, PayloadType::VideoSlice) => {
+                let capture_ns = header.timestamp_ns;
                 let frame = self.video.ingest(&header, &payload, now_ns);
-                ReceivedEvent::VideoProgress { frame }
+                ReceivedEvent::VideoProgress { frame, capture_ns }
             }
             _ => ReceivedEvent::Telemetry(payload),
         }
@@ -311,6 +312,11 @@ impl ReceiveDemux {
 pub enum ReceivedEvent {
     Duplicate,
     ControlOrdered(Vec<Vec<u8>>),
-    VideoProgress { frame: Option<Vec<u8>> },
+    VideoProgress {
+        frame: Option<Vec<u8>>,
+        /// Capture timestamp from the LTP header (`timestamp_ns`), carried through
+        /// for end-to-end latency measurement at the display.
+        capture_ns: u64,
+    },
     Telemetry(Vec<u8>),
 }

@@ -21,9 +21,9 @@ pub use header::{LtpHeader, PayloadType, PriorityClass, LTP_MAGIC, LTP_VERSION};
 pub use session::{Session, SessionConfig};
 
 pub use ffi::{
-    ltp_abi_version, ltp_last_error, ltp_poll_recv, ltp_recv_pop, ltp_recv_video_pending_bytes,
-    ltp_send_control, ltp_send_twist_stub, ltp_session_create, ltp_session_destroy, ltp_config,
-    LtpSessionHandle, LTP_ABI_VERSION,
+    ltp_abi_version, ltp_last_error, ltp_poll_recv, ltp_recv_last_video_age_us, ltp_recv_pop,
+    ltp_recv_video_pending_bytes, ltp_send_control, ltp_send_twist_stub, ltp_session_create,
+    ltp_session_destroy, ltp_config, LtpSessionHandle, LTP_ABI_VERSION,
 };
 
 #[cfg(test)]
