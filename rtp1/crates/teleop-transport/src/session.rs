@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 
 use crate::bonding::{fast_switch_path, mode_for, pick_split_path, BondingPolicy, SendMode};
 use crate::framer::{frame_datagram, split_header_payload};
-use crate::header::{LtpHeader, PayloadType, PriorityClass, FLAG_DUPLICATE_SEND};
+use crate::header::{LtpHeader, PayloadType, PriorityClass, stamp_path_tag_in_place};
 use crate::ingress::{IngressQueue, IngressDatagram};
 use crate::path::{PathConfig, PathHandle};
 use crate::receive::ReceiveDemux;
@@ -74,8 +74,8 @@ impl Session {
 
     pub fn flush_send(&mut self) -> io::Result<()> {
         self.scheduler.reset_telemetry_tick();
-        while let Some(pkt) = self.scheduler.pop_next() {
-            match self.send_datagram_on_paths(&pkt) {
+        while let Some(mut pkt) = self.scheduler.pop_next() {
+            match self.send_datagram_on_paths(&mut pkt) {
                 Ok(()) => {}
                 Err(e)
                     if matches!(
@@ -83,9 +83,6 @@ impl Session {
                         io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                     ) =>
                 {
-                    // Non-blocking UDP: kernel TX queue full. Keep ordering by putting this
-                    // datagram back and trying again on the next `flush_send` (caller should
-                    // call flush even when not enqueueing new video).
                     self.scheduler.enqueue(pkt);
                     break;
                 }
@@ -95,34 +92,23 @@ impl Session {
         Ok(())
     }
 
-    fn send_datagram_on_paths(&mut self, pkt: &ScheduledPacket) -> io::Result<()> {
-        let (h, pl) = split_header_payload(&pkt.datagram)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad datagram"))?;
+    fn send_datagram_on_paths(&mut self, pkt: &mut ScheduledPacket) -> io::Result<()> {
         let mode = mode_for(pkt.priority, pkt.payload_type);
-        let rtt: Vec<f64> = self.paths.iter().map(|p| p.metrics.rtt_ewma_ms).collect();
-        let loss: Vec<f64> = self.paths.iter().map(|p| p.metrics.loss_ewma).collect();
         match mode {
             SendMode::Duplicate => {
                 for p in &self.paths {
-                    let mut hdr = h.clone();
-                    hdr.path_tag = p.path_tag();
-                    hdr.flags |= FLAG_DUPLICATE_SEND;
-                    let mut buf = Vec::new();
-                    hdr.write_into(&mut buf);
-                    buf.extend_from_slice(pl);
-                    p.send_to(self.cfg.peer, &buf)?;
+                    stamp_path_tag_in_place(&mut pkt.datagram, p.path_tag(), true);
+                    p.send_to(self.cfg.peer, &pkt.datagram)?;
                 }
             }
             SendMode::Split => {
+                let rtt: Vec<f64> = self.paths.iter().map(|p| p.metrics.rtt_ewma_ms).collect();
+                let loss: Vec<f64> = self.paths.iter().map(|p| p.metrics.loss_ewma).collect();
                 let idx = pick_split_path(&rtt);
                 let idx = fast_switch_path(idx, &loss, &rtt, &self.baseline_rtt, &self.cfg.bonding);
                 let p = &self.paths[idx];
-                let mut hdr = h.clone();
-                hdr.path_tag = p.path_tag();
-                let mut buf = Vec::new();
-                hdr.write_into(&mut buf);
-                buf.extend_from_slice(pl);
-                p.send_to(self.cfg.peer, &buf)?;
+                stamp_path_tag_in_place(&mut pkt.datagram, p.path_tag(), false);
+                p.send_to(self.cfg.peer, &pkt.datagram)?;
             }
         }
         Ok(())
@@ -144,6 +130,7 @@ impl Session {
                 out.push(ev);
             }
         }
+        self.demux.sweep_stale_if_due(now_ns);
         out
     }
 }

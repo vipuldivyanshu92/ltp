@@ -21,14 +21,13 @@ const RECV_QUEUE_MAX: usize = 64;
 
 enum RecvItem {
     Control { schema_id: u16, payload: Vec<u8> },
-    VideoJpeg(Vec<u8>),
 }
 
-fn push_recv(h: &mut LtpSessionHandle, item: RecvItem) {
+fn push_recv_control(h: &mut LtpSessionHandle, schema_id: u16, payload: Vec<u8>) {
     while h.recv_queue.len() >= RECV_QUEUE_MAX {
         h.recv_queue.pop_front();
     }
-    h.recv_queue.push_back(item);
+    h.recv_queue.push_back(RecvItem::Control { schema_id, payload });
 }
 
 fn enqueue_events(h: &mut LtpSessionHandle, events: Vec<ReceivedEvent>) {
@@ -38,19 +37,14 @@ fn enqueue_events(h: &mut LtpSessionHandle, events: Vec<ReceivedEvent>) {
             ReceivedEvent::ControlOrdered(chunks) => {
                 for chunk in chunks {
                     if let Ok(env) = ControlEnvelope::decode(&chunk) {
-                        push_recv(
-                            h,
-                            RecvItem::Control {
-                                schema_id: env.schema_id,
-                                payload: env.payload,
-                            },
-                        );
+                        push_recv_control(h, env.schema_id, env.payload);
                     }
                 }
             }
             ReceivedEvent::VideoProgress { frame } => {
                 if let Some(jpeg) = frame {
-                    push_recv(h, RecvItem::VideoJpeg(jpeg));
+                    // Latest JPEG only: never queue behind high-rate control (would starve display).
+                    h.pending_video = Some(jpeg);
                 }
             }
             ReceivedEvent::Telemetry(_) => {}
@@ -96,6 +90,8 @@ pub struct ltp_config {
 pub struct LtpSessionHandle {
     inner: Session,
     recv_queue: VecDeque<RecvItem>,
+    /// Most recent complete video frame not yet consumed by `ltp_recv_pop`.
+    pending_video: Option<Vec<u8>>,
 }
 
 fn parse_addr(host: *const c_char, port: u16) -> Result<SocketAddr, LtpErr> {
@@ -146,6 +142,7 @@ pub extern "C" fn ltp_session_create(cfg: *const ltp_config) -> *mut LtpSessionH
     Box::into_raw(Box::new(LtpSessionHandle {
         inner: session,
         recv_queue: VecDeque::new(),
+        pending_video: None,
     }))
 }
 
@@ -201,6 +198,18 @@ pub extern "C" fn ltp_send_control(
     }
 }
 
+/// Bytes of the complete JPEG waiting for `ltp_recv_pop` (0 if none). Call before popping with a
+/// small buffer so the app can allocate `max(cap, ltp_recv_video_pending_bytes(p))` for the next
+/// video pop; otherwise control may be delivered while an oversized JPEG stays pending forever.
+#[no_mangle]
+pub extern "C" fn ltp_recv_video_pending_bytes(p: *const LtpSessionHandle) -> usize {
+    if p.is_null() {
+        return 0;
+    }
+    let h = unsafe { &*p };
+    h.pending_video.as_ref().map(|j| j.len()).unwrap_or(0)
+}
+
 #[no_mangle]
 pub extern "C" fn ltp_poll_recv(p: *mut LtpSessionHandle, now_ns: u64) -> c_int {
     if p.is_null() {
@@ -210,6 +219,7 @@ pub extern "C" fn ltp_poll_recv(p: *mut LtpSessionHandle, now_ns: u64) -> c_int 
     if let Err(_) = sess.inner.poll_ingress() {
         return set_err(LtpErr::Io);
     }
+    // drain_ingress now also sweeps stale partial video frames periodically.
     let events = sess.inner.drain_ingress(true, now_ns);
     enqueue_events(sess, events);
     set_err(LtpErr::Ok)
@@ -235,33 +245,61 @@ pub extern "C" fn ltp_recv_pop(
         return -1;
     }
     let h = unsafe { &mut *p };
-    if h.recv_queue.is_empty() {
+    let video_len = h.pending_video.as_ref().map(|j| j.len());
+    let control_len = h
+        .recv_queue
+        .front()
+        .map(|it| match it {
+            RecvItem::Control { payload, .. } => payload.len(),
+        });
+    if video_len.is_none() && control_len.is_none() {
         return 0;
     }
-    let need = match h.recv_queue.front().unwrap() {
-        RecvItem::Control { payload, .. } => payload.len(),
-        RecvItem::VideoJpeg(p) => p.len(),
-    };
-    if need > cap {
+
+    // Deliver video first when it fits — but if the JPEG is larger than `cap`, still return
+    // control so a small recv buffer cannot deadlock the session (video would block every pop).
+    if let Some(vl) = video_len {
+        if vl <= cap {
+            let jpeg = h.pending_video.take().unwrap();
+            let (kind, schema, src) = (1i32, 0u16, jpeg);
+            unsafe {
+                if !buf.is_null() && !src.is_empty() {
+                    ptr::copy_nonoverlapping(src.as_ptr(), buf, src.len());
+                }
+                *out_kind = kind;
+                *out_schema_id = schema;
+                *out_len = src.len();
+            }
+            return 1;
+        }
+    }
+
+    if let Some(RecvItem::Control { .. }) = h.recv_queue.front() {
+        let need = control_len.unwrap_or(0);
+        if need > cap {
+            unsafe {
+                *out_len = video_len.unwrap_or(0).max(need);
+            }
+            return -2;
+        }
+        let RecvItem::Control { schema_id, payload } = h.recv_queue.pop_front().unwrap();
+        let (kind, schema, src) = (0i32, schema_id, payload);
         unsafe {
-            *out_len = need;
+            if !buf.is_null() && !src.is_empty() {
+                ptr::copy_nonoverlapping(src.as_ptr(), buf, src.len());
+            }
+            *out_kind = kind;
+            *out_schema_id = schema;
+            *out_len = src.len();
         }
-        return -2;
+        return 1;
     }
-    let item = h.recv_queue.pop_front().unwrap();
-    let (kind, schema, src) = match item {
-        RecvItem::Control { schema_id, payload } => (0i32, schema_id, payload),
-        RecvItem::VideoJpeg(payload) => (1i32, 0u16, payload),
-    };
+
+    // Only an oversized pending video, no control.
     unsafe {
-        if !buf.is_null() && !src.is_empty() {
-            ptr::copy_nonoverlapping(src.as_ptr(), buf, src.len());
-        }
-        *out_kind = kind;
-        *out_schema_id = schema;
-        *out_len = src.len();
+        *out_len = video_len.unwrap_or(0);
     }
-    1
+    -2
 }
 
 #[no_mangle]

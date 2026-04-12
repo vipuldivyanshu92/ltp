@@ -71,9 +71,21 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import socket
 import time
 
 logger = logging.getLogger(__name__)
+
+_RELAY_BUF_SIZE = 4 * 1024 * 1024  # 4 MiB
+
+
+def _tune_udp_buffers(sock: socket.socket) -> None:
+    """Best-effort enlarge of kernel UDP send/recv buffers."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, _RELAY_BUF_SIZE)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, _RELAY_BUF_SIZE)
+    except OSError:
+        pass
 
 
 class RelayState:
@@ -144,6 +156,9 @@ class RelayProtocol(asyncio.DatagramProtocol):
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.transport = transport  # type: ignore[assignment]
         dt = transport  # type: ignore[assignment]
+        sock = dt.get_extra_info("socket")
+        if sock is not None:
+            _tune_udp_buffers(sock)
         if self.side == "leader":
             self.state.leader_transport = dt
         else:

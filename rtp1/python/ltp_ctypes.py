@@ -64,6 +64,8 @@ def load():
     lib.ltp_send_control.restype = c_int
     lib.ltp_poll_recv.argtypes = [ctypes.c_void_p, c_uint64]
     lib.ltp_poll_recv.restype = c_int
+    lib.ltp_recv_video_pending_bytes.argtypes = [ctypes.c_void_p]
+    lib.ltp_recv_video_pending_bytes.restype = ctypes.c_size_t
     lib.ltp_recv_pop.argtypes = [
         ctypes.c_void_p,
         POINTER(c_int),
@@ -167,7 +169,8 @@ class LtpSession:
         """Returns (kind, schema_id, payload) or None if empty. schema_id is meaningful for CONTROL kind."""
         if not self._ptr:
             raise RuntimeError("session closed")
-        cap = 256 * 1024
+        need_video = int(self._lib.ltp_recv_video_pending_bytes(self._ptr))
+        cap = max(1024 * 1024, need_video + 4096)
         while True:
             buf = ctypes.create_string_buffer(cap)
             out_len = c_size_t(0)

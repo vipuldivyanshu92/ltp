@@ -46,9 +46,15 @@ int ltp_send_control(LtpSessionHandle *p, uint16_t stream_id, uint16_t schema_id
 
 int ltp_poll_recv(LtpSessionHandle *p, uint64_t now_ns);
 
+/** Complete JPEG size waiting for ltp_recv_pop, or 0. Size the video pop buffer to at least this. */
+size_t ltp_recv_video_pending_bytes(const LtpSessionHandle *p);
+
 /**
  * Pop one item queued by ltp_poll_recv. For LTP_RECV_KIND_CONTROL, out_schema_id is the
  * application schema and buf receives the inner payload bytes (after ControlEnvelope).
+ * Complete video frames are returned before queued control so high-rate control cannot bury JPEGs.
+ * If the pending JPEG is larger than cap, control may still be popped so teleop does not stall;
+ * use ltp_recv_video_pending_bytes and then pop again with a large enough buf to copy the JPEG.
  * Returns 1 on success, 0 if empty, -1 on invalid args, -2 if cap < payload (*out_len = needed).
  */
 int ltp_recv_pop(LtpSessionHandle *p, int *out_kind, uint16_t *out_schema_id,

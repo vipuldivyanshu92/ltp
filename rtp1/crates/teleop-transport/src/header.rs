@@ -245,6 +245,21 @@ impl LtpHeader {
     }
 }
 
+const PATH_TAG_OFFSET: usize = 10;
+const FLAGS_OFFSET: usize = 7;
+
+/// Stamp `path_tag` (and optionally `FLAG_DUPLICATE_SEND`) directly in a
+/// serialized datagram without parsing or reallocating.
+pub fn stamp_path_tag_in_place(datagram: &mut [u8], path_tag: u16, set_dup_flag: bool) {
+    if datagram.len() >= FIXED_HEADER_LEN {
+        datagram[PATH_TAG_OFFSET..PATH_TAG_OFFSET + 2]
+            .copy_from_slice(&path_tag.to_be_bytes());
+        if set_dup_flag {
+            datagram[FLAGS_OFFSET] |= FLAG_DUPLICATE_SEND;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

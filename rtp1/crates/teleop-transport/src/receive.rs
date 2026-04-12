@@ -242,12 +242,17 @@ mod video_reassembly_tests {
     }
 }
 
+/// Sweep interval: avoid calling sweep_stale on every datagram. 500ms is generous
+/// enough to let multi-slice frames complete while still cleaning up promptly.
+const SWEEP_INTERVAL_NS: u64 = 500_000_000;
+
 /// Route parsed packets: control/haptic → reorder; video → reassembly; telemetry → passthrough.
 pub struct ReceiveDemux {
     pub dedup: DedupTable,
     pub control_reorder: HashMap<u16, StreamReorder>,
     pub video: VideoReassembly,
     pub max_reorder: u32,
+    last_sweep_ns: u64,
 }
 
 impl ReceiveDemux {
@@ -257,6 +262,15 @@ impl ReceiveDemux {
             control_reorder: HashMap::new(),
             video: VideoReassembly::default(),
             max_reorder,
+            last_sweep_ns: 0,
+        }
+    }
+
+    /// Sweep stale partial video frames at most once per `SWEEP_INTERVAL_NS`.
+    pub fn sweep_stale_if_due(&mut self, now_ns: u64) {
+        if now_ns.saturating_sub(self.last_sweep_ns) >= SWEEP_INTERVAL_NS {
+            self.video.sweep_stale(now_ns);
+            self.last_sweep_ns = now_ns;
         }
     }
 

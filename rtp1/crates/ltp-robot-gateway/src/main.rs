@@ -8,7 +8,7 @@
 
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr, TcpStream};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -327,9 +327,8 @@ fn ltp_main_loop(
 
     loop {
         let t0 = Instant::now();
-        let wall = Instant::now();
 
-        if teleop.is_none() && wall >= next_teleop_try {
+        if teleop.is_none() && t0 >= next_teleop_try {
             match open_teleop_stream(teleop_addr) {
                 Ok(s) => {
                     info!("teleop TCP connected to {teleop_addr}");
@@ -337,21 +336,21 @@ fn ltp_main_loop(
                     teleop_backoff = Duration::from_millis(200);
                 }
                 Err(e) => {
-                    if wall >= next_teleop_warn {
+                    if t0 >= next_teleop_warn {
                         warn!(
                             "teleop TCP {teleop_addr}: {e:#} — LTP/UDP video still runs without it; start quest_teleop when ready (this message every 15s)"
                         );
-                        next_teleop_warn = wall + Duration::from_secs(15);
+                        next_teleop_warn = t0 + Duration::from_secs(15);
                     }
-                    next_teleop_try = wall + teleop_backoff;
+                    next_teleop_try = t0 + teleop_backoff;
                     teleop_backoff = (teleop_backoff * 2).min(Duration::from_secs(2));
                 }
             }
         }
 
+        // Always poll ingress + flush pending before anything else so control
+        // packets never wait behind a sleep or channel recv.
         session.poll_ingress()?;
-        // Drain scheduler after a prior WouldBlock, or when video threads produced frames
-        // faster than the last flush completed.
         session.flush_send()?;
         let now = now_ns();
         let events = session.drain_ingress(true, now);
@@ -385,7 +384,9 @@ fn ltp_main_loop(
             }
         }
 
+        let mut got_jpeg = false;
         while let Ok((cam, jpeg)) = jpeg_rx.try_recv() {
+            got_jpeg = true;
             let cam = cam as usize;
             if cam >= 4 {
                 continue;
@@ -404,43 +405,23 @@ fn ltp_main_loop(
             }
         }
 
-        match jpeg_rx.recv_timeout(Duration::from_millis(2)) {
-            Ok((cam, jpeg)) => {
-                let cam = cam as usize;
-                if cam < 4 {
-                    global_frame_id = global_frame_id.wrapping_add(1);
-                    let sid = (cam as u16) + 1;
-                    let fid = global_frame_id;
-                    let cap = now_ns();
-                    match send_jpeg_ltp(&mut session, sid, &mut seq, fid, &jpeg, cap) {
-                        Ok(n) => {
-                            stats.jpeg_frames[cam] += 1;
-                            stats.jpeg_bytes[cam] += jpeg.len() as u64;
-                            stats.ltp_slices_encoded += n as u64;
-                        }
-                        Err(e) => warn!("send_jpeg_ltp cam{cam}: {e}"),
-                    }
-                }
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return Ok(()),
-        }
-
         let pending = session.pending_send_datagrams();
         stats.last_pending_send = pending;
         stats.max_pending_send = stats.max_pending_send.max(pending);
-        stats.maybe_log(wall);
+        stats.maybe_log(t0);
 
-        // When the LTP scheduler still has datagrams (often after UDP WouldBlock), avoid sleeping
-        // a full 2ms so we return to flush_send sooner and drain the kernel TX queue faster.
+        // Adaptive sleep: stay tight when datagrams are queued or JPEGs are
+        // flowing; idle longer only when nothing is happening to save CPU.
         let elapsed = t0.elapsed();
-        if pending > 0 {
-            let min_period = Duration::from_micros(400);
-            if elapsed < min_period {
-                std::thread::sleep(min_period - elapsed);
-            }
-        } else if elapsed < Duration::from_millis(2) {
-            std::thread::sleep(Duration::from_millis(2) - elapsed);
+        let target = if pending > 0 {
+            Duration::from_micros(50)
+        } else if got_jpeg {
+            Duration::from_micros(200)
+        } else {
+            Duration::from_micros(500)
+        };
+        if elapsed < target {
+            std::thread::sleep(target - elapsed);
         }
     }
 }
