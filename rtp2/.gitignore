@@ -1,1 +1,5 @@
-./advanced-teleop/target
+./advanced-teleop/target/debug
+./advanced-teleop/target/release
+./advanced-teleop/target/deps
+./advanced-teleop/target/build
+./advanced-teleop/target/incremental

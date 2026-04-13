@@ -2,6 +2,9 @@
 members = [
     "agent",
     "client",
-    "common"
+    "common",
+    "cloud-relay",
+    "robot-relay",
+    "quest-proxy",
 ]
 resolver = "2"

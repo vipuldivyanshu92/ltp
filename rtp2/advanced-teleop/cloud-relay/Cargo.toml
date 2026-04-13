@@ -1,0 +1,20 @@
+[package]
+name = "cloud-relay"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "cloud-relay"
+path = "src/main.rs"
+
+[dependencies]
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
+anyhow = "1"
+rustls-pemfile = "2"

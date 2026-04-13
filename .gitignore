@@ -10,3 +10,13 @@ rtp2/advanced-teleop/client
 rtp2/advanced-teleop/common
 
 rtp2/advanced-teleop/target/release/deps/
+
+*.timestamp
+
+rtp2/advanced-teleop/target/debug/deps/
+
+rtp2/advanced-teleop/target/debug/.fingerprint/cloud-relay-183e1474400b506b/
+
+rtp2/advanced-teleop/target/debug/.fingerprint/deranged-e2998875eb9ff7e8/dep-lib-deranged
+
+rtp2/advanced-teleop/target/debug/.fingerprint/deranged-e2998875eb9ff7e8/
