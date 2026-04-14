@@ -60,18 +60,15 @@ struct Args {
     teleop_tcp: String,
 
     /// Target video FPS per camera (0 = unlimited)
-    #[arg(long, default_value_t = 15)]
+    #[arg(long, default_value_t = 30)]
     video_fps: u32,
 
-    /// Camera ROS compressed topics (must be 4, same order as Quest panels)
+    /// Camera ROS compressed topics (1–4, same order as Quest panels)
     #[arg(
         long,
-        num_args = 4,
+        num_args = 1..=4,
         default_values = [
             "/cam_chest/image_raw/compressed",
-            "/cam_waist/image_raw/compressed",
-            "/cam_wrist_l/image_raw/compressed",
-            "/cam_wrist_r/image_raw/compressed",
         ]
     )]
     topics: Vec<String>,
@@ -448,9 +445,13 @@ async fn main() -> Result<()> {
         }
     });
 
-    // ── Video: JPEG channel → QUIC uni-streams ──────────────────────
+    // ── Video: JPEG channel → QUIC uni-streams (parallel sends) ──────
 
     let mut fps_limiter = FpsLimiter::new(args.video_fps);
+    // Allow up to 16 frames in-flight to avoid head-of-line blocking between
+    // cameras, while limiting memory usage if the network is slower than the
+    // camera source.
+    let send_semaphore = Arc::new(tokio::sync::Semaphore::new(16));
 
     while let Some(frame) = jpeg_rx.recv().await {
         let cam = frame.cam as usize;
@@ -464,31 +465,42 @@ async fn main() -> Result<()> {
         let fid = frame_id_counter.fetch_add(1, Ordering::Relaxed);
         let hdr = encode_video_header(frame.cam, fid, frame.jpeg.len() as u32);
 
-        // Open a unidirectional stream for each frame.
-        match conn.open_uni().await {
-            Ok(mut send) => {
-                let jpeg_len = frame.jpeg.len();
-                // Write header + payload, then finish the stream.
-                let write_result = async {
-                    send.write_all(&hdr).await?;
-                    send.write_all(&frame.jpeg).await?;
-                    send.finish()?;
-                    Ok::<(), anyhow::Error>(())
-                }
-                .await;
+        // Acquire a permit before spawning (blocks if 16 frames already in-flight).
+        let permit = match send_semaphore.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break, // semaphore closed
+        };
 
-                if let Err(e) = write_result {
-                    warn!("video uni-stream write error: {e}");
-                } else {
-                    frames_sent[cam].fetch_add(1, Ordering::Relaxed);
-                    bytes_sent.fetch_add(jpeg_len as u64, Ordering::Relaxed);
+        let conn = conn.clone();
+        let fs = frames_sent.clone();
+        let bs = bytes_sent.clone();
+
+        tokio::spawn(async move {
+            let _permit = permit; // held until send completes
+
+            match conn.open_uni().await {
+                Ok(mut send) => {
+                    let jpeg_len = frame.jpeg.len();
+                    let write_result = async {
+                        send.write_all(&hdr).await?;
+                        send.write_all(&frame.jpeg).await?;
+                        send.finish()?;
+                        Ok::<(), anyhow::Error>(())
+                    }
+                    .await;
+
+                    if let Err(e) = write_result {
+                        warn!("video uni-stream write error: {e}");
+                    } else {
+                        fs[cam].fetch_add(1, Ordering::Relaxed);
+                        bs.fetch_add(jpeg_len as u64, Ordering::Relaxed);
+                    }
+                }
+                Err(e) => {
+                    error!("open_uni to cloud failed: {e}; connection may be lost");
                 }
             }
-            Err(e) => {
-                error!("open_uni to cloud failed: {e}; connection lost?");
-                break;
-            }
-        }
+        });
     }
 
     info!("robot-relay shutting down");

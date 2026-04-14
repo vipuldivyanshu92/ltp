@@ -1,13 +1,22 @@
-//! Operator-side proxy: connects to the cloud QUIC relay, exposes a local
-//! WebSocket server on :9192 (mimicking anvil_streamer) and a TCP server on
-//! :8082 (accepting TelemetryPacket from the Quest).
+//! Operator-side proxy: exposes a local WebSocket server on :9192 (mimicking
+//! anvil_streamer) and a TCP server on :8082 (accepting TelemetryPacket from
+//! the Quest).
 //!
-//! Video path:  cloud-relay QUIC uni-streams → parse 8B hdr → WS binary to Quest
-//! Control path: Quest TCP :8082 → 112-byte packets → QUIC bidi-stream → cloud-relay → robot
+//! **Video** has two modes:
+//!   1. `--local-ws ws://127.0.0.1:9191`  (recommended for same-machine)
+//!      Subscribes directly to anvil_streamer's WebSocket — zero relay latency.
+//!   2. `--cloud-host <VPS_IP>` (remote operation)
+//!      Receives video from cloud-relay via QUIC uni-streams.
+//!
+//! **Control** always flows through the cloud relay:
+//!   Quest TCP :8082 → QUIC bidi-stream → cloud-relay → robot-relay → ROS
 //!
 //! Usage:
+//!   # Same-machine (best latency):
+//!   quest-proxy --local-ws ws://127.0.0.1:9191 --cloud-host <VPS_IP>
+//!
+//!   # Remote only:
 //!   quest-proxy --cloud-host <VPS_IP>
-//!   quest-proxy --cloud-host <VPS_IP> --ws-port 9192 --teleop-port 8082
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,21 +40,26 @@ const TELEOP_PKT_LEN: usize = 112;
 #[derive(Parser, Debug)]
 #[command(name = "quest-proxy")]
 struct Args {
-    /// Cloud relay hostname
+    /// Cloud relay hostname (required for control; optional for video if --local-ws is set)
     #[arg(long)]
-    cloud_host: String,
+    cloud_host: Option<String>,
 
     /// Cloud relay QUIC port
     #[arg(long, default_value_t = 4433)]
     cloud_port: u16,
 
-    /// Local WebSocket port (mimics anvil_streamer)
+    /// Local WebSocket port exposed to the Quest (mimics anvil_streamer)
     #[arg(long, default_value_t = 9192)]
     ws_port: u16,
 
     /// Local TCP port for Quest teleop data
     #[arg(long, default_value_t = 8082)]
     teleop_port: u16,
+
+    /// Direct WebSocket URL to anvil_streamer (e.g. ws://127.0.0.1:9191).
+    /// When set, video is fetched directly from this WS, bypassing the cloud relay.
+    #[arg(long)]
+    local_ws: Option<String>,
 }
 
 // ── QUIC client setup ───────────────────────────────────────────────────
@@ -56,7 +70,6 @@ fn build_quic_client_config() -> Result<quinn::ClientConfig> {
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
 
-    // Must match one of the server's advertised ALPNs for the handshake to succeed.
     crypto.alpn_protocols = vec![b"teleop-quest".to_vec()];
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(
@@ -114,18 +127,56 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
     }
 }
 
-// ── Per-camera broadcast channel ────────────────────────────────────────
+// ── Topic broadcast ─────────────────────────────────────────────────────
 
-/// Maps camera topic string → broadcast sender of JPEG bytes.
 type TopicMap = Arc<RwLock<HashMap<String, broadcast::Sender<Vec<u8>>>>>;
 
-/// Camera index → topic mapping (same as robot-relay default).
-const CAMERA_TOPICS: [&str; 4] = [
+/// Camera index → topic mapping.
+const CAMERA_TOPICS: [&str; 1] = [
     "/cam_chest/image_raw/compressed",
-    "/cam_waist/image_raw/compressed",
-    "/cam_wrist_l/image_raw/compressed",
-    "/cam_wrist_r/image_raw/compressed",
 ];
+
+// ── JPEG assembly (for local WS mode) ──────────────────────────────────
+
+struct JpegAssembler {
+    buf: Vec<u8>,
+}
+
+impl JpegAssembler {
+    fn new() -> Self {
+        Self { buf: Vec::with_capacity(256 * 1024) }
+    }
+
+    fn push_chunk(&mut self, chunk: &[u8]) -> Vec<Vec<u8>> {
+        let mut frames = Vec::new();
+        self.buf.extend_from_slice(chunk);
+
+        loop {
+            // Find SOI (0xFF 0xD8)
+            let soi = match self.buf.windows(2).position(|w| w == [0xFF, 0xD8]) {
+                Some(p) => p,
+                None => {
+                    self.buf.clear();
+                    break;
+                }
+            };
+            if soi > 0 {
+                self.buf.drain(..soi);
+            }
+
+            // Find EOI (0xFF 0xD9) after SOI
+            let eoi = match self.buf[2..].windows(2).position(|w| w == [0xFF, 0xD9]) {
+                Some(p) => p + 2 + 2, // offset from start + marker size
+                None => break,         // incomplete frame
+            };
+
+            let jpeg = self.buf[..eoi].to_vec();
+            self.buf.drain(..eoi);
+            frames.push(jpeg);
+        }
+        frames
+    }
+}
 
 // ── Main ────────────────────────────────────────────────────────────────
 
@@ -139,9 +190,19 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    let use_local_ws = args.local_ws.is_some();
     info!(
-        "quest-proxy: cloud {}:{} | WS :{} | teleop TCP :{}",
-        args.cloud_host, args.cloud_port, args.ws_port, args.teleop_port
+        "quest-proxy: {} | WS :{} | teleop TCP :{}",
+        if let Some(ref ws) = args.local_ws {
+            format!("local-ws {}", ws)
+        } else if let Some(ref host) = args.cloud_host {
+            format!("cloud {}:{}", host, args.cloud_port)
+        } else {
+            "NO VIDEO SOURCE (need --local-ws or --cloud-host)".to_string()
+        },
+        args.ws_port,
+        args.teleop_port,
     );
 
     // ── Topic broadcast channels ────────────────────────────────────
@@ -150,32 +211,10 @@ async fn main() -> Result<()> {
     {
         let mut map = topics.write().await;
         for topic in &CAMERA_TOPICS {
-            let (tx, _) = broadcast::channel::<Vec<u8>>(8); // small buffer; drop old frames
+            let (tx, _) = broadcast::channel::<Vec<u8>>(4); // small buffer; drop old frames
             map.insert(topic.to_string(), tx);
         }
     }
-
-    // ── QUIC connection to cloud relay ──────────────────────────────
-
-    let client_config = build_quic_client_config()?;
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
-    endpoint.set_default_client_config(client_config);
-
-    let cloud_addr: std::net::SocketAddr = tokio::net::lookup_host(format!(
-        "{}:{}",
-        args.cloud_host, args.cloud_port
-    ))
-    .await
-    .context("DNS lookup")?
-    .next()
-    .context("no address resolved")?;
-
-    info!("connecting to cloud relay at {cloud_addr}...");
-    let conn = endpoint
-        .connect(cloud_addr, "teleop-relay")?
-        .await
-        .context("QUIC connect to cloud")?;
-    info!("connected to cloud relay");
 
     // ── Stats ───────────────────────────────────────────────────────
 
@@ -184,132 +223,314 @@ async fn main() -> Result<()> {
     {
         let vfr = video_frames_recv.clone();
         let cs = ctrl_sent.clone();
+        let last_vfr = Arc::new(AtomicU64::new(0));
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
             loop {
                 interval.tick().await;
+                let cur = vfr.load(Ordering::Relaxed);
+                let prev = last_vfr.swap(cur, Ordering::Relaxed);
+                let delta = cur - prev;
+                let fps = delta as f64 / 5.0;
                 info!(
-                    "stats: video_frames_recv={} ctrl_sent={}",
-                    vfr.load(Ordering::Relaxed),
+                    "stats: video_frames={cur} (+{delta} = {fps:.1} fps) ctrl_sent={}",
                     cs.load(Ordering::Relaxed)
                 );
             }
         });
     }
 
-    // ── Task 1: receive QUIC uni-streams (video) → topic broadcasts ─
+    // ── Video source (local WS or QUIC) ─────────────────────────────
 
-    let conn_video = conn.clone();
-    let topics_video = topics.clone();
-    let vfr = video_frames_recv.clone();
+    if let Some(ref local_ws_url) = args.local_ws {
+        // LOCAL WS MODE: subscribe directly to anvil_streamer
+        let url = local_ws_url.clone();
+        let topics_video = topics.clone();
+        let vfr = video_frames_recv.clone();
 
-    tokio::spawn(async move {
-        loop {
-            let mut recv_stream = match conn_video.accept_uni().await {
-                Ok(s) => s,
-                Err(quinn::ConnectionError::ApplicationClosed(_)) => break,
-                Err(e) => {
-                    warn!("video accept_uni error: {e}");
-                    break;
-                }
-            };
-
+        for (cam_index, topic) in CAMERA_TOPICS.iter().enumerate() {
+            let url = url.clone();
+            let topic = topic.to_string();
             let topics = topics_video.clone();
             let vfr = vfr.clone();
 
             tokio::spawn(async move {
-                // Read full stream (8B hdr + JPEG).
-                let data = match recv_stream.read_to_end(8 * 1024 * 1024).await {
-                    Ok(d) => d,
+                let mut backoff = Duration::from_millis(200);
+                loop {
+                    info!("local-ws cam{cam_index}: connecting to {url} topic={topic}");
+                    let ws_stream = match tokio_tungstenite::connect_async(&url).await {
+                        Ok((ws, _)) => ws,
+                        Err(e) => {
+                            warn!("local-ws cam{cam_index} connect failed: {e}");
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(Duration::from_secs(5));
+                            continue;
+                        }
+                    };
+                    backoff = Duration::from_millis(200);
+
+                    let (mut ws_write, mut ws_read) = ws_stream.split();
+
+                    // Subscribe to topic
+                    if let Err(e) = ws_write
+                        .send(tokio_tungstenite::tungstenite::Message::Text(topic.clone().into()))
+                        .await
+                    {
+                        error!("local-ws cam{cam_index} subscribe: {e}");
+                        continue;
+                    }
+                    info!("local-ws cam{cam_index}: subscribed to {topic}");
+
+                    let mut asm = JpegAssembler::new();
+                    loop {
+                        match ws_read.next().await {
+                            Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(data))) => {
+                                for jpeg in asm.push_chunk(&data) {
+                                    vfr.fetch_add(1, Ordering::Relaxed);
+                                    let map = topics.read().await;
+                                    if let Some(tx) = map.get(&topic) {
+                                        let _ = tx.send(jpeg);
+                                    }
+                                }
+                            }
+                            Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(p))) => {
+                                let _ = ws_write
+                                    .send(tokio_tungstenite::tungstenite::Message::Pong(p))
+                                    .await;
+                            }
+                            Some(Ok(_)) => {}
+                            Some(Err(e)) => {
+                                warn!("local-ws cam{cam_index} read error: {e}");
+                                break;
+                            }
+                            None => {
+                                info!("local-ws cam{cam_index}: stream ended");
+                                break;
+                            }
+                        }
+                    }
+
+                    info!("local-ws cam{cam_index}: disconnected, retrying...");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            });
+        }
+    } else if let Some(ref cloud_host) = args.cloud_host {
+        // QUIC MODE: receive video from cloud relay
+        let client_config = build_quic_client_config()?;
+        let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
+        endpoint.set_default_client_config(client_config);
+
+        let cloud_addr: std::net::SocketAddr = tokio::net::lookup_host(format!(
+            "{}:{}",
+            cloud_host, args.cloud_port
+        ))
+        .await
+        .context("DNS lookup")?
+        .next()
+        .context("no address resolved")?;
+
+        info!("connecting to cloud relay at {cloud_addr}...");
+        let conn = endpoint
+            .connect(cloud_addr, "teleop-relay")?
+            .await
+            .context("QUIC connect to cloud")?;
+        info!("connected to cloud relay");
+
+        // Video: QUIC uni-streams → topic broadcasts
+        let conn_video = conn.clone();
+        let topics_video = topics.clone();
+        let vfr = video_frames_recv.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let mut recv_stream = match conn_video.accept_uni().await {
+                    Ok(s) => s,
+                    Err(quinn::ConnectionError::ApplicationClosed(_)) => break,
                     Err(e) => {
-                        warn!("video stream read: {e}");
-                        return;
+                        warn!("video accept_uni error: {e}");
+                        break;
                     }
                 };
 
-                if data.len() < VIDEO_HDR_LEN {
-                    return;
-                }
+                let topics = topics_video.clone();
+                let vfr = vfr.clone();
 
-                let cam_index = data[0] as usize;
-                if cam_index >= 4 {
-                    return;
-                }
-
-                let jpeg = data[VIDEO_HDR_LEN..].to_vec();
-                vfr.fetch_add(1, Ordering::Relaxed);
-
-                // Broadcast to subscribers of this topic.
-                let topic = CAMERA_TOPICS[cam_index];
-                let map = topics.read().await;
-                if let Some(tx) = map.get(topic) {
-                    // If no subscribers, this is a no-op (just drops).
-                    let _ = tx.send(jpeg);
-                }
-            });
-        }
-    });
-
-    // ── Task 2: control — TCP :8081 → QUIC bidi-stream ─────────────
-
-    let conn_ctrl = conn.clone();
-    let cs = ctrl_sent.clone();
-    let teleop_port = args.teleop_port;
-
-    tokio::spawn(async move {
-        let listener = match TcpListener::bind(format!("0.0.0.0:{teleop_port}")).await {
-            Ok(l) => l,
-            Err(e) => {
-                error!("failed to bind TCP :{teleop_port}: {e}");
-                return;
-            }
-        };
-        info!("teleop TCP server listening on :{teleop_port}");
-
-        loop {
-            let (mut tcp_stream, peer) = match listener.accept().await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("TCP accept error: {e}");
-                    continue;
-                }
-            };
-            info!("teleop TCP client connected from {peer}");
-            tcp_stream.set_nodelay(true).ok();
-
-            // Open a bidi stream for this quest connection.
-            let (mut quic_send, _quic_recv) = match conn_ctrl.open_bi().await {
-                Ok(s) => s,
-                Err(e) => {
-                    error!("failed to open control bidi: {e}");
-                    continue;
-                }
-            };
-
-            let cs = cs.clone();
-
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; TELEOP_PKT_LEN];
-                loop {
-                    match tcp_stream.read_exact(&mut buf).await {
-                        Ok(_) => {}
+                tokio::spawn(async move {
+                    let data = match recv_stream.read_to_end(8 * 1024 * 1024).await {
+                        Ok(d) => d,
                         Err(e) => {
-                            info!("teleop TCP read ended: {e}");
+                            warn!("video stream read: {e}");
+                            return;
+                        }
+                    };
+
+                    if data.len() < VIDEO_HDR_LEN {
+                        return;
+                    }
+
+                    let cam_index = data[0] as usize;
+                    if cam_index >= CAMERA_TOPICS.len() {
+                        return;
+                    }
+
+                    let jpeg = data[VIDEO_HDR_LEN..].to_vec();
+                    vfr.fetch_add(1, Ordering::Relaxed);
+
+                    let topic = CAMERA_TOPICS[cam_index];
+                    let map = topics.read().await;
+                    if let Some(tx) = map.get(topic) {
+                        let _ = tx.send(jpeg);
+                    }
+                });
+            }
+        });
+
+        // Control: TCP → QUIC bidi-stream
+        let conn_ctrl = conn.clone();
+        let cs = ctrl_sent.clone();
+        let teleop_port = args.teleop_port;
+
+        tokio::spawn(async move {
+            let listener = match TcpListener::bind(format!("0.0.0.0:{teleop_port}")).await {
+                Ok(l) => l,
+                Err(e) => {
+                    error!("failed to bind teleop TCP :{teleop_port}: {e}");
+                    return;
+                }
+            };
+            info!("teleop TCP server listening on :{teleop_port}");
+
+            loop {
+                let (mut tcp_stream, peer) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("teleop TCP accept: {e}");
+                        continue;
+                    }
+                };
+                info!("teleop TCP client connected from {peer}");
+
+                let conn = conn_ctrl.clone();
+                let cs = cs.clone();
+
+                tokio::spawn(async move {
+                    let (mut quic_send, _quic_recv) = match conn.open_bi().await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!("control open_bi: {e}");
+                            return;
+                        }
+                    };
+
+                    let mut buf = vec![0u8; TELEOP_PKT_LEN];
+                    loop {
+                        match tcp_stream.read_exact(&mut buf).await {
+                            Ok(_) => {}
+                            Err(e) => {
+                                info!("teleop TCP read ended: {e}");
+                                break;
+                            }
+                        }
+                        if let Err(e) = quic_send.write_all(&buf).await {
+                            warn!("control QUIC write: {e}");
                             break;
                         }
+                        cs.fetch_add(1, Ordering::Relaxed);
                     }
-                    if let Err(e) = quic_send.write_all(&buf).await {
-                        warn!("control QUIC write: {e}");
-                        break;
-                    }
-                    cs.fetch_add(1, Ordering::Relaxed);
-                }
-                let _ = quic_send.finish();
-            });
-        }
-    });
+                    let _ = quic_send.finish();
+                });
+            }
+        });
+    } else {
+        warn!("No video source configured. Use --local-ws or --cloud-host.");
+    }
 
-    // ── Task 3: WS server :9191 (mimics anvil_streamer) ─────────────
+    // ── Control TCP (local-ws mode needs its own control handler) ────
+
+    if use_local_ws {
+        if let Some(ref cloud_host) = args.cloud_host {
+            // Connect to cloud relay for control only
+            let client_config = build_quic_client_config()?;
+            let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
+            endpoint.set_default_client_config(client_config);
+
+            let cloud_addr: std::net::SocketAddr = tokio::net::lookup_host(format!(
+                "{}:{}",
+                cloud_host, args.cloud_port
+            ))
+            .await
+            .context("DNS lookup")?
+            .next()
+            .context("no address resolved")?;
+
+            info!("connecting to cloud relay for control at {cloud_addr}...");
+            let conn = endpoint
+                .connect(cloud_addr, "teleop-relay")?
+                .await
+                .context("QUIC connect to cloud for control")?;
+            info!("connected to cloud relay for control");
+
+            let cs = ctrl_sent.clone();
+            let teleop_port = args.teleop_port;
+
+            tokio::spawn(async move {
+                let listener = match TcpListener::bind(format!("0.0.0.0:{teleop_port}")).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        error!("failed to bind teleop TCP :{teleop_port}: {e}");
+                        return;
+                    }
+                };
+                info!("teleop TCP server listening on :{teleop_port}");
+
+                loop {
+                    let (mut tcp_stream, peer) = match listener.accept().await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!("teleop TCP accept: {e}");
+                            continue;
+                        }
+                    };
+                    info!("teleop TCP client connected from {peer}");
+
+                    let conn = conn.clone();
+                    let cs = cs.clone();
+
+                    tokio::spawn(async move {
+                        let (mut quic_send, _quic_recv) = match conn.open_bi().await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                error!("control open_bi: {e}");
+                                return;
+                            }
+                        };
+
+                        let mut buf = vec![0u8; TELEOP_PKT_LEN];
+                        loop {
+                            match tcp_stream.read_exact(&mut buf).await {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    info!("teleop TCP read ended: {e}");
+                                    break;
+                                }
+                            }
+                            if let Err(e) = quic_send.write_all(&buf).await {
+                                warn!("control QUIC write: {e}");
+                                break;
+                            }
+                            cs.fetch_add(1, Ordering::Relaxed);
+                        }
+                        let _ = quic_send.finish();
+                    });
+                }
+            });
+        } else {
+            warn!("No --cloud-host specified; teleop control disabled. Quest controllers won't move the robot.");
+        }
+    }
+
+    // ── WS server (exposed to Quest via adb reverse) ────────────────
 
     let ws_listener =
         TcpListener::bind(format!("0.0.0.0:{}", args.ws_port)).await?;
@@ -342,7 +563,7 @@ async fn handle_ws_client(
     let topic = loop {
         match ws_read.next().await {
             Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t))) => break t,
-            Some(Ok(_)) => continue, // skip non-text
+            Some(Ok(_)) => continue,
             Some(Err(e)) => anyhow::bail!("WS read error: {e}"),
             None => anyhow::bail!("WS closed before topic"),
         }
@@ -376,7 +597,6 @@ async fn handle_ws_client(
             }
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 warn!("WS client {peer} lagged {n} frames");
-                // Continue — we'll catch up with the latest frame.
             }
             Err(broadcast::error::RecvError::Closed) => {
                 info!("topic channel closed for {peer}");

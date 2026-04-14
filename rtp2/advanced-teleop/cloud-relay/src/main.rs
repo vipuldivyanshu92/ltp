@@ -5,8 +5,8 @@
 //! - `teleop-quest`: the operator-side proxy (receives video, sends control)
 //!
 //! **Video** (robot → quest): robot opens unidirectional streams carrying
-//! `[8-byte header | JPEG payload]`. The relay reads each stream fully and
-//! opens a matching unidirectional stream to the quest peer.
+//! `[8-byte header | JPEG payload]`. The relay streams bytes directly to a
+//! matching unidirectional stream on the quest peer (zero-copy, no buffering).
 //!
 //! **Control** (quest → robot): the first bidirectional stream opened by
 //! either side is the control channel. 112-byte `TelemetryPacket` records
@@ -25,10 +25,7 @@ use quinn::crypto::rustls::QuicServerConfig;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-/// Video frame header prefixed to every unidirectional stream payload.
-const VIDEO_HDR_LEN: usize = 8;
-#[allow(dead_code)]
-const TELEOP_PKT_LEN: usize = 112;
+// (wire protocol constants are in robot-relay and quest-proxy only)
 
 // ── CLI ──────────────────────────────────────────────────────────────────
 
@@ -325,30 +322,30 @@ async fn handle_connection(incoming: quinn::Incoming, state: Arc<RelayState>) ->
     Ok(())
 }
 
-/// Read an entire unidirectional stream and write it to a new uni stream on the target peer.
+/// Stream a unidirectional stream directly to the target peer (zero-copy relay).
+/// Opens a matching uni stream on the target and pipes bytes as they arrive.
 async fn forward_uni_stream(
     mut recv: quinn::RecvStream,
     target_role: Role,
     state: &RelayState,
 ) -> Result<()> {
-    // Read the full stream (video frame).  Limit to 8 MB to prevent abuse.
-    let data = recv
-        .read_to_end(8 * 1024 * 1024)
-        .await
-        .context("read uni stream")?;
-
-    if data.len() < VIDEO_HDR_LEN {
-        return Ok(()); // runt
-    }
-
-    // Forward to target if connected.
+    // Get target connection first so we can start streaming immediately.
     let target_conn = match state.get_peer(target_role) {
         Some(c) => c,
-        None => return Ok(()), // no peer yet, drop
+        None => {
+            // No peer connected yet; drain and discard.
+            let _ = recv.read_to_end(8 * 1024 * 1024).await;
+            return Ok(());
+        }
     };
 
     let mut send = target_conn.open_uni().await.context("open_uni to target")?;
-    send.write_all(&data).await.context("write uni to target")?;
+
+    // Stream bytes directly from recv → send without buffering the entire frame.
+    tokio::io::copy(&mut recv, &mut send)
+        .await
+        .context("streaming copy")?;
+
     send.finish().context("finish uni stream")?;
     Ok(())
 }
