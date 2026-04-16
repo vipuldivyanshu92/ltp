@@ -125,3 +125,31 @@ Offset  Size  Field
 - QUIC's built-in congestion control prevents flooding the network link.
 - Connection migration allows the operator to switch WiFi/cellular without
   dropping the session.
+
+Camera → WS → robot-relay:     ~1ms (local)
+robot-relay → cloud-relay:     ~RTT/2 (network upload)
+cloud-relay streaming:         ~0ms (pipe-through)
+cloud-relay → quest-proxy:     ~RTT/2 (network download)
+quest-proxy → Quest WS:       ~1ms (adb reverse)
+Quest JPEG decode:             ~3-5ms
+────────────────────────────────────
+Total:                         ~RTT + 5ms
+
+
+cargo build --release --target x86_64-unknown-linux-musl -p cloud-relay -p robot-relay -p quest-proxy
+
+./robot-relay --cloud-host <VPS_IP> --video-fps 0
+
+adb reverse tcp:9191 tcp:9192   # video
+adb reverse tcp:8081 tcp:8082   # control
+
+./quest-proxy --cloud-host <VPS_IP>
+
+
+scp -i "West-coast-key.pem" /Users/vipuldivyanshu/workspace/axiom/openarm-custom/cloud-relay ubuntu@ec2-54-153-43-113.us-west-1.compute.amazonaws.com:/home/ubuntu/
+
+cp /Users/vipuldivyanshu/workspace/axiom/light-touch-protocol/rtp2/advanced-teleop/target/x86_64-unknown-linux-musl/release/cloud-relay /Users/vipuldivyanshu/workspace/axiom/openarm-custom
+
+cp /Users/vipuldivyanshu/workspace/axiom/light-touch-protocol/rtp2/advanced-teleop/target/x86_64-unknown-linux-musl/release/robot-relay /Users/vipuldivyanshu/workspace/axiom/openarm-custom
+
+cp /Users/vipuldivyanshu/workspace/axiom/light-touch-protocol/rtp2/advanced-teleop/target/x86_64-unknown-linux-musl/release/quest-proxy /Users/vipuldivyanshu/workspace/axiom/openarm-custom

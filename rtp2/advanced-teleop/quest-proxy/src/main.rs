@@ -83,6 +83,8 @@ fn build_quic_client_config() -> Result<quinn::ClientConfig> {
     transport.send_window(64_000_000);
     transport.stream_receive_window(16_000_000u32.into());
     transport.keep_alive_interval(Some(Duration::from_secs(5)));
+    // BBR: probes bandwidth instead of reacting to loss. Much better for real-time video.
+    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     client_config.transport_config(Arc::new(transport));
     Ok(client_config)
 }

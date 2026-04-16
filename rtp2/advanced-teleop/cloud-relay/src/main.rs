@@ -100,6 +100,8 @@ fn build_server_config(
     transport.stream_receive_window(16_000_000u32.into());
     // Keep-alives to survive NAT.
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+    // BBR: probes bandwidth instead of reacting to loss. Much better for real-time video.
+    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     server_config.transport_config(Arc::new(transport));
     Ok(server_config)
 }

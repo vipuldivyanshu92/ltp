@@ -1,8 +1,14 @@
 //! Robot-side relay: bridges local anvil_streamer (WS :9191) and quest_teleop
 //! (TCP :8081) to the cloud QUIC relay.
 //!
-//! Video path:  anvil_streamer WS → JPEG assembly → QUIC uni-stream → cloud-relay → quest
+//! Video path:  anvil_streamer WS → JPEG assembly → per-camera latest-frame →
+//!              QUIC uni-stream → cloud-relay → quest
 //! Control path: cloud-relay QUIC bidi-stream → 112-byte packets → TCP :8081 → ROS
+//!
+//! Latency optimizations:
+//!   - Per-camera watch channels: always sends the LATEST frame, drops stale ones
+//!   - BBR congestion control: probes bandwidth instead of reacting to loss
+//!   - No frame queuing: if network is slower than camera, old frames are skipped
 //!
 //! Usage:
 //!   robot-relay --cloud-host <VPS_IP> --cloud-port 4433
@@ -17,7 +23,7 @@ use futures_util::{SinkExt, StreamExt};
 use quinn::crypto::rustls::QuicClientConfig;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 // ── Wire protocol ───────────────────────────────────────────────────────
@@ -76,6 +82,7 @@ struct Args {
 
 // ── JPEG assembly ───────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct JpegFrame {
     cam: u8,
     jpeg: Vec<u8>,
@@ -162,13 +169,11 @@ impl FpsLimiter {
 // ── QUIC client setup ───────────────────────────────────────────────────
 
 fn build_quic_client_config() -> Result<quinn::ClientConfig> {
-    // Accept any certificate (self-signed relay).
     let mut crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
 
-    // Must match one of the server's advertised ALPNs for the handshake to succeed.
     crypto.alpn_protocols = vec![b"teleop-robot".to_vec()];
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(
@@ -182,6 +187,8 @@ fn build_quic_client_config() -> Result<quinn::ClientConfig> {
     transport.send_window(64_000_000);
     transport.stream_receive_window(16_000_000u32.into());
     transport.keep_alive_interval(Some(Duration::from_secs(5)));
+    // BBR: probes bandwidth instead of reacting to loss. Much better for real-time video.
+    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     client_config.transport_config(Arc::new(transport));
     Ok(client_config)
 }
@@ -240,8 +247,9 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     info!(
-        "robot-relay: WS {}:{} | cloud {}:{} | teleop TCP {}",
-        args.ws_host, args.ws_port, args.cloud_host, args.cloud_port, args.teleop_tcp
+        "robot-relay: WS {}:{} | cloud {}:{} | teleop TCP {} | {}fps",
+        args.ws_host, args.ws_port, args.cloud_host, args.cloud_port, args.teleop_tcp,
+        args.video_fps
     );
 
     // ── QUIC connection to cloud relay ──────────────────────────────
@@ -264,52 +272,84 @@ async fn main() -> Result<()> {
         .connect(cloud_addr, "teleop-relay")?
         .await
         .context("QUIC connect to cloud")?;
-    info!("connected to cloud relay");
+    info!("connected to cloud relay (BBR congestion control)");
 
     // ── Stats ───────────────────────────────────────────────────────
 
-    let frames_sent = Arc::new([
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
+    let frames_sent: Arc<[AtomicU64; 4]> = Arc::new([
+        AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0),
+    ]);
+    let frames_dropped: Arc<[AtomicU64; 4]> = Arc::new([
+        AtomicU64::new(0), AtomicU64::new(0),
+        AtomicU64::new(0), AtomicU64::new(0),
     ]);
     let bytes_sent = Arc::new(AtomicU64::new(0));
     let ctrl_received = Arc::new(AtomicU64::new(0));
     let frame_id_counter = Arc::new(AtomicU16::new(0));
 
-    // Stats printer
+    // Stats printer — per-interval deltas for FPS
     {
         let fs = frames_sent.clone();
+        let fd = frames_dropped.clone();
         let bs = bytes_sent.clone();
         let cr = ctrl_received.clone();
+        let n_cams = args.topics.len();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
+            let mut prev_sent = [0u64; 4];
+            let mut prev_drop = [0u64; 4];
             loop {
                 interval.tick().await;
-                let f: Vec<u64> = fs.iter().map(|a| a.load(Ordering::Relaxed)).collect();
-                let b = bs.load(Ordering::Relaxed);
-                let c = cr.load(Ordering::Relaxed);
+                let mut sent_fps = Vec::new();
+                let mut drop_fps = Vec::new();
+                for i in 0..n_cams {
+                    let s = fs[i].load(Ordering::Relaxed);
+                    let d = fd[i].load(Ordering::Relaxed);
+                    sent_fps.push(format!("{:.1}", (s - prev_sent[i]) as f64 / 5.0));
+                    drop_fps.push(format!("{}", d - prev_drop[i]));
+                    prev_sent[i] = s;
+                    prev_drop[i] = d;
+                }
                 info!(
-                    "stats: frames/cam={f:?} total_bytes={b} ctrl_pkts={c}"
+                    "stats: sent_fps=[{}] dropped=[{}] bytes={} ctrl={}",
+                    sent_fps.join(", "),
+                    drop_fps.join(", "),
+                    bs.load(Ordering::Relaxed),
+                    cr.load(Ordering::Relaxed),
                 );
             }
         });
     }
 
-    // ── Channel: WS tasks send JPEGs here, main loop sends to QUIC ─
+    // ── Per-camera watch channels (latest-frame-wins) ───────────────
+    //
+    // Each camera has a watch channel. The WS receiver writes the latest
+    // JPEG, and the per-camera QUIC send task reads it. If the network is
+    // slower than the camera, intermediate frames are automatically dropped
+    // by watch — the sender always sees the latest frame.
 
-    let (jpeg_tx, mut jpeg_rx) = mpsc::channel::<JpegFrame>(64);
+    let num_cams = args.topics.len();
+    let mut watch_txs: Vec<watch::Sender<Option<JpegFrame>>> = Vec::new();
+    let mut watch_rxs: Vec<watch::Receiver<Option<JpegFrame>>> = Vec::new();
+
+    for _ in 0..num_cams {
+        let (tx, rx) = watch::channel::<Option<JpegFrame>>(None);
+        watch_txs.push(tx);
+        watch_rxs.push(rx);
+    }
 
     // ── WS subscriber tasks (one per camera) ────────────────────────
 
+    let target_fps = args.video_fps;
     for (i, topic) in args.topics.iter().enumerate() {
         let ws_url = format!("ws://{}:{}/", args.ws_host, args.ws_port);
         let topic = topic.clone();
-        let tx = jpeg_tx.clone();
+        let tx = watch_txs[i].clone();
         let cam_index = i as u8;
 
         tokio::spawn(async move {
+            let mut fps_limiter = FpsLimiter::new(target_fps);
             let mut backoff = Duration::from_millis(300);
             loop {
                 info!("WS cam{cam_index}: connecting to {ws_url} topic={topic}");
@@ -326,8 +366,12 @@ async fn main() -> Result<()> {
 
                 let (mut ws_write, mut ws_read) = ws_stream.split();
 
-                // Subscribe to topic
-                if let Err(e) = ws_write.send(tokio_tungstenite::tungstenite::Message::Text(topic.clone().into())).await {
+                if let Err(e) = ws_write
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        topic.clone().into(),
+                    ))
+                    .await
+                {
                     error!("WS cam{cam_index} subscribe send: {e}");
                     continue;
                 }
@@ -338,22 +382,23 @@ async fn main() -> Result<()> {
                     match ws_read.next().await {
                         Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(data))) => {
                             for jpeg in asm.push_chunk(&data) {
-                                if tx
-                                    .send(JpegFrame {
-                                        cam: cam_index,
-                                        jpeg,
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    return; // channel closed
+                                // FPS limiter: drop excess frames at source
+                                if !fps_limiter.allow(cam_index as usize) {
+                                    continue;
                                 }
+                                // Send to watch — overwrites any unsent frame (latest-wins)
+                                let _ = tx.send(Some(JpegFrame {
+                                    cam: cam_index,
+                                    jpeg,
+                                }));
                             }
                         }
                         Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(p))) => {
-                            let _ = ws_write.send(tokio_tungstenite::tungstenite::Message::Pong(p)).await;
+                            let _ = ws_write
+                                .send(tokio_tungstenite::tungstenite::Message::Pong(p))
+                                .await;
                         }
-                        Some(Ok(_)) => {} // text, pong, etc
+                        Some(Ok(_)) => {}
                         Some(Err(e)) => {
                             warn!("WS cam{cam_index} read error: {e}");
                             break;
@@ -370,7 +415,73 @@ async fn main() -> Result<()> {
             }
         });
     }
-    drop(jpeg_tx); // we keep only clones in tasks
+    // Drop the original senders — clones live in WS tasks
+    drop(watch_txs);
+
+    // ── Per-camera QUIC send tasks ──────────────────────────────────
+    //
+    // Each camera has its own send loop. When a new frame arrives via the
+    // watch channel, we send it. If the previous send is still in progress
+    // when a new frame arrives, the watch channel stores only the latest,
+    // so we NEVER accumulate a backlog.
+
+    for (cam_idx, mut rx) in watch_rxs.into_iter().enumerate() {
+        let conn = conn.clone();
+        let fid_counter = frame_id_counter.clone();
+        let fs = frames_sent.clone();
+        let fd = frames_dropped.clone();
+        let bs = bytes_sent.clone();
+
+        tokio::spawn(async move {
+            loop {
+                // Wait for a new frame from the WS receiver
+                if rx.changed().await.is_err() {
+                    info!("cam{cam_idx}: watch channel closed");
+                    break;
+                }
+
+                // Grab the latest frame
+                let frame = match rx.borrow_and_update().clone() {
+                    Some(f) => f,
+                    None => continue,
+                };
+
+                let jpeg_len = frame.jpeg.len();
+                let fid = fid_counter.fetch_add(1, Ordering::Relaxed);
+                let hdr = encode_video_header(frame.cam, fid, jpeg_len as u32);
+
+                // Send via QUIC uni-stream
+                match conn.open_uni().await {
+                    Ok(mut send) => {
+                        let write_result = async {
+                            send.write_all(&hdr).await?;
+                            send.write_all(&frame.jpeg).await?;
+                            send.finish()?;
+                            Ok::<(), anyhow::Error>(())
+                        }
+                        .await;
+
+                        if let Err(e) = write_result {
+                            warn!("cam{cam_idx}: uni-stream write error: {e}");
+                        } else {
+                            fs[cam_idx].fetch_add(1, Ordering::Relaxed);
+                            bs.fetch_add(jpeg_len as u64, Ordering::Relaxed);
+                        }
+                    }
+                    Err(e) => {
+                        error!("cam{cam_idx}: open_uni failed: {e}");
+                        // Don't break — wait for next frame, connection may recover
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+
+                // Check if frames were skipped while we were sending
+                if rx.has_changed().unwrap_or(false) {
+                    fd[cam_idx].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+    }
 
     // ── Control: cloud-relay bidi-stream → TCP :8081 ─────────────────
 
@@ -379,9 +490,6 @@ async fn main() -> Result<()> {
     let ctrl_received2 = ctrl_received.clone();
 
     tokio::spawn(async move {
-        // The cloud relay opens a bidi stream to us for each quest control
-        // session.  We accept each one and forward 112-byte packets to the
-        // ROS quest_teleop TCP server.
         loop {
             let (_quic_send, mut quic_recv) = match conn_ctrl.accept_bi().await {
                 Ok(s) => s,
@@ -397,13 +505,11 @@ async fn main() -> Result<()> {
             let ctrl_received2 = ctrl_received2.clone();
 
             tokio::spawn(async move {
-                // Connect to quest_teleop TCP and forward.
                 let mut tcp: Option<TcpStream> = None;
                 let mut tcp_backoff = Duration::from_millis(200);
                 let mut buf = vec![0u8; TELEOP_PKT_LEN];
 
                 loop {
-                    // Read exactly 112 bytes from QUIC.
                     match quic_recv.read_exact(&mut buf).await {
                         Ok(()) => {}
                         Err(e) => {
@@ -414,7 +520,6 @@ async fn main() -> Result<()> {
 
                     ctrl_received2.fetch_add(1, Ordering::Relaxed);
 
-                    // Ensure TCP connection to quest_teleop.
                     loop {
                         if tcp.is_some() {
                             break;
@@ -445,65 +550,8 @@ async fn main() -> Result<()> {
         }
     });
 
-    // ── Video: JPEG channel → QUIC uni-streams (parallel sends) ──────
-
-    let mut fps_limiter = FpsLimiter::new(args.video_fps);
-    // Allow up to 16 frames in-flight to avoid head-of-line blocking between
-    // cameras, while limiting memory usage if the network is slower than the
-    // camera source.
-    let send_semaphore = Arc::new(tokio::sync::Semaphore::new(16));
-
-    while let Some(frame) = jpeg_rx.recv().await {
-        let cam = frame.cam as usize;
-        if cam >= 4 {
-            continue;
-        }
-        if !fps_limiter.allow(cam) {
-            continue;
-        }
-
-        let fid = frame_id_counter.fetch_add(1, Ordering::Relaxed);
-        let hdr = encode_video_header(frame.cam, fid, frame.jpeg.len() as u32);
-
-        // Acquire a permit before spawning (blocks if 16 frames already in-flight).
-        let permit = match send_semaphore.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => break, // semaphore closed
-        };
-
-        let conn = conn.clone();
-        let fs = frames_sent.clone();
-        let bs = bytes_sent.clone();
-
-        tokio::spawn(async move {
-            let _permit = permit; // held until send completes
-
-            match conn.open_uni().await {
-                Ok(mut send) => {
-                    let jpeg_len = frame.jpeg.len();
-                    let write_result = async {
-                        send.write_all(&hdr).await?;
-                        send.write_all(&frame.jpeg).await?;
-                        send.finish()?;
-                        Ok::<(), anyhow::Error>(())
-                    }
-                    .await;
-
-                    if let Err(e) = write_result {
-                        warn!("video uni-stream write error: {e}");
-                    } else {
-                        fs[cam].fetch_add(1, Ordering::Relaxed);
-                        bs.fetch_add(jpeg_len as u64, Ordering::Relaxed);
-                    }
-                }
-                Err(e) => {
-                    error!("open_uni to cloud failed: {e}; connection may be lost");
-                }
-            }
-        });
-    }
-
-    info!("robot-relay shutting down");
-    conn.close(0u32.into(), b"shutdown");
+    // Keep main alive until QUIC connection closes
+    let reason = conn.closed().await;
+    info!("robot-relay shutting down: {reason}");
     Ok(())
 }
